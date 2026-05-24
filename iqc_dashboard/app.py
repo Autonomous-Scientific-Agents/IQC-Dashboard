@@ -723,6 +723,45 @@ def is_energy_metadata_column(column_name: str) -> bool:
     return column_name.endswith("_eV") or column_name == "S_eV/K"
 
 
+def is_missing_scalar(value) -> bool:
+    """Return True for scalar null values without treating arrays as ambiguous."""
+    if value is None:
+        return True
+    if isinstance(value, (list, tuple, np.ndarray)):
+        return False
+    try:
+        return bool(pd.isna(value))
+    except (TypeError, ValueError):
+        return False
+
+
+def format_all_data_value(column_name: str, value, energy_unit: str) -> str:
+    """Format one selected-molecule field for the All Data table."""
+    if is_missing_scalar(value):
+        return "N/A"
+    if isinstance(value, np.ndarray):
+        return str(value.tolist())
+    if isinstance(value, (list, tuple)):
+        return str(value)
+    if is_energy_metadata_column(column_name):
+        return format_energy_value(value, energy_unit, precision=6)
+    return str(value)
+
+
+def build_all_data_table(molecule_data: pd.Series, energy_unit: str) -> pd.DataFrame:
+    """Build a complete selected-molecule row table for display."""
+    rows = []
+    for column_name, value in molecule_data.items():
+        rows.append(
+            {
+                "Field": energy_metadata_label(column_name, energy_unit),
+                "Value": format_all_data_value(column_name, value, energy_unit),
+            }
+        )
+
+    return pd.DataFrame(rows, columns=["Field", "Value"])
+
+
 def create_ir_spectrum_plot(
     frequencies,
     intensities,
@@ -1699,58 +1738,13 @@ def main(data_paths: Optional[List[str]] = None):
 
                 st.markdown("---")
 
-                # Metadata Table
-                st.subheader("Metadata")
-
-                # Select relevant scalar columns to display
-                metadata_cols = [
-                    "unique_name",
-                    "formula",
-                    "number_of_atoms",
-                    "number_of_electrons",
-                    "spin",
-                    "calculator",
-                    "task",
-                    "model",
-                    "opt_steps",
-                    "opt_time",
-                    "vib_time",
-                    "thermo_time",
-                    "G_eV",
-                    "H_eV",
-                    "S_eV/K",
-                    "E_ZPE_eV",
-                    "number_of_imaginary",
-                    "smiles_changed",
-                    "opt_converged",
-                    "initial_symmetry",
-                    "opt_sym",
-                    "initial_sym_number",
-                    "opt_sym_number",
-                ]
-
-                metadata_dict = {}
-                for col in metadata_cols:
-                    if col in molecule_data.index:
-                        value = molecule_data[col]
-                        if pd.notna(value):
-                            # Convert to string to avoid Arrow serialization issues with mixed types
-                            display_col = energy_metadata_label(col, energy_unit)
-                            if isinstance(value, (list, np.ndarray)):
-                                metadata_dict[display_col] = str(value)
-                            elif is_energy_metadata_column(col):
-                                metadata_dict[display_col] = format_energy_value(
-                                    value,
-                                    energy_unit,
-                                    precision=6,
-                                )
-                            else:
-                                metadata_dict[display_col] = str(value)
-
-                if metadata_dict:
-                    metadata_df = pd.DataFrame([metadata_dict]).T
-                    metadata_df.columns = ["Value"]
-                    st.dataframe(metadata_df, use_container_width=True)
+                st.subheader("All Data")
+                all_data_df = build_all_data_table(molecule_data, energy_unit)
+                st.dataframe(
+                    all_data_df,
+                    use_container_width=True,
+                    hide_index=True,
+                )
             else:
                 st.warning(f"Molecule '{displayed_molecule}' not found in dataset.")
         else:

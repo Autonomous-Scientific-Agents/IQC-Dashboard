@@ -13,6 +13,7 @@ from iqc_dashboard.app import (
     DataManager,
     ENERGY_UNIT_EV,
     ENERGY_UNIT_KCAL,
+    build_all_data_table,
     build_ligand_selector_df,
     calculate_reaction_gibbs,
     convert_energy_value,
@@ -334,6 +335,35 @@ class TestDataManager:
         """Test invalid energy units fail clearly."""
         with pytest.raises(ValueError):
             convert_energy_value(1.0, "hartree")
+
+    def test_build_all_data_table_includes_every_field(self):
+        """Test selected molecule All Data table includes all row fields."""
+        molecule_data = pd.Series(
+            {
+                "unique_name": "mol_001",
+                "G_eV": 1.0,
+                "spectrum_intensities": [0.1, 0.2],
+                "custom_field": "custom value",
+                "missing_value": float("nan"),
+            }
+        )
+
+        result = build_all_data_table(molecule_data, ENERGY_UNIT_KCAL)
+
+        assert result["Field"].tolist() == [
+            "unique_name",
+            "G (kcal/mol)",
+            "spectrum_intensities",
+            "custom_field",
+            "missing_value",
+        ]
+        assert result["Value"].tolist() == [
+            "mol_001",
+            "23.060500 kcal/mol",
+            "[0.1, 0.2]",
+            "custom value",
+            "N/A",
+        ]
 
     def test_build_ligand_selector_df_filters_non_reaction_rows(self):
         """Test ligand selector data only keeps rows with parsed bipyridine and ligand values."""
