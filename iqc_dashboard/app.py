@@ -4,6 +4,7 @@ A high-performance Streamlit app for analyzing computational chemistry data from
 """
 
 import streamlit as st
+import streamlit.components.v1 as components
 import duckdb
 import pandas as pd
 import plotly.express as px
@@ -16,6 +17,7 @@ import re
 import difflib
 import html
 import hashlib
+import json
 
 EV_TO_KCAL_MOL = 23.0605
 ENERGY_UNIT_KCAL = "kcal/mol"
@@ -55,6 +57,42 @@ COMPARISON_SUMMARY_COLUMNS = (
     "opt_time",
     "number_of_imaginary",
 )
+DESCRIPTOR_DEFINITIONS = (
+    {
+        "id": "reactant_n_ni_c_angles",
+        "label": "N-Ni-C Angles",
+        "role": "reactant",
+        "unit": "deg",
+    },
+    {
+        "id": "product_o1_ni_c_beta_angle",
+        "label": "O1-Ni-C_beta Angle",
+        "role": "product",
+        "unit": "deg",
+    },
+    {
+        "id": "product_mean_n_ni_o1_angle",
+        "label": "Mean N-Ni-O1 Angle",
+        "role": "product",
+        "unit": "deg",
+    },
+    {
+        "id": "product_ni_n_distance_difference",
+        "label": "|Ni-N_A - Ni-N_B|",
+        "role": "product",
+        "unit": "angstrom",
+    },
+    {
+        "id": "product_ni_bpy_plane_distance",
+        "label": "Ni Distance From Bpy Plane",
+        "role": "product",
+        "unit": "angstrom",
+    },
+)
+DESCRIPTOR_UNIT_LABELS = {
+    "deg": "degrees",
+    "angstrom": "Å",
+}
 
 # Import 3D visualization libraries - will be checked when needed
 STMOL_AVAILABLE = False
@@ -1626,20 +1664,22 @@ def parse_xyz_coordinates(xyz_string: str) -> Optional[Tuple[List[str], np.ndarr
     if not xyz_string or is_missing_scalar(xyz_string):
         return None
 
-    lines = [line.strip() for line in str(xyz_string).splitlines() if line.strip()]
-    if not lines:
+    raw_lines = [line.strip() for line in str(xyz_string).splitlines()]
+    if not raw_lines or not any(raw_lines):
         return None
 
-    atom_lines = lines
+    atom_lines = [line for line in raw_lines if line]
     try:
-        atom_count = int(lines[0])
-        atom_lines = lines[2 : 2 + atom_count]
+        atom_count = int(raw_lines[0])
+        atom_lines = raw_lines[2 : 2 + atom_count]
     except (ValueError, IndexError):
         pass
 
     elements = []
     coordinates = []
     for line in atom_lines:
+        if not line:
+            continue
         parts = line.split()
         if len(parts) < 4:
             continue
@@ -1917,6 +1957,696 @@ def build_geometry_optimization_summary(
         "angle_changes": rank_geometry_changes(angle_rows, "Δ (°)", limit),
         "dihedral_changes": rank_geometry_changes(dihedral_rows, "Δ (°)", limit),
     }
+
+
+# ============================================================================
+# Descriptor Helper Functions
+# ============================================================================
+
+
+def get_descriptor_definition(descriptor_id: str) -> Optional[dict]:
+    """Return descriptor metadata by ID."""
+    for descriptor in DESCRIPTOR_DEFINITIONS:
+        if descriptor["id"] == descriptor_id:
+            return descriptor
+    return None
+
+
+def format_descriptor_unit(unit: str) -> str:
+    """Return a display unit label for descriptor values."""
+    return DESCRIPTOR_UNIT_LABELS.get(unit, unit)
+
+
+def get_preferred_xyz(row: pd.Series) -> Optional[str]:
+    """Return optimized XYZ when available, otherwise initial XYZ."""
+    for column in ("opt_xyz", "initial_xyz"):
+        value = row.get(column, None)
+        if not is_missing_scalar(value):
+            return str(value)
+    return None
+
+
+def get_preferred_smiles(row: pd.Series) -> str:
+    """Return optimized SMILES when available, otherwise initial SMILES."""
+    for column in ("opt_smiles", "initial_smiles"):
+        value = row.get(column, None)
+        if not is_missing_scalar(value):
+            return str(value)
+    return ""
+
+
+def nearest_atom_indices(
+    elements: List[str],
+    coords: np.ndarray,
+    center_index: int,
+    element_symbol: str,
+    count: int = 1,
+    excluded_indices: Optional[set[int]] = None,
+) -> List[int]:
+    """Return atom indices for the nearest atoms of one element to a center atom."""
+    excluded_indices = excluded_indices or set()
+    candidates = []
+    for atom_index, element in enumerate(elements):
+        if atom_index == center_index or atom_index in excluded_indices:
+            continue
+        if element != element_symbol:
+            continue
+        distance = calculate_distance(coords, center_index, atom_index)
+        candidates.append((distance, atom_index))
+
+    candidates.sort(key=lambda item: (item[0], item[1]))
+    return [atom_index for _, atom_index in candidates[:count]]
+
+
+def oxygen_neighbor_count(elements: List[str], coords: np.ndarray, atom_index: int) -> int:
+    """Count oxygen atoms close enough to be bonded to a carbon-like atom."""
+    return sum(
+        1
+        for other_index, element in enumerate(elements)
+        if element == "O" and calculate_distance(coords, atom_index, other_index) <= 1.6
+    )
+
+
+def build_cn_adjacency(elements: List[str], coords: np.ndarray) -> List[set[int]]:
+    """Build a C/N covalent-neighbor graph for ligand plane detection."""
+    adjacency = [set() for _ in elements]
+    for atom_i, element_i in enumerate(elements):
+        if element_i not in {"C", "N"}:
+            continue
+        for atom_j in range(atom_i + 1, len(elements)):
+            element_j = elements[atom_j]
+            if element_j not in {"C", "N"}:
+                continue
+            distance = calculate_distance(coords, atom_i, atom_j)
+            if 1.05 <= distance <= 1.85:
+                adjacency[atom_i].add(atom_j)
+                adjacency[atom_j].add(atom_i)
+    return adjacency
+
+
+def collect_bpy_plane_indices(
+    elements: List[str],
+    coords: np.ndarray,
+    ni_index: int,
+    donor_n_indices: List[int],
+) -> List[int]:
+    """
+    Infer the bipyridine plane atoms from the two Ni-bound N donors.
+
+    The XYZ data has element symbols but no atom names, so this uses a local C/N
+    graph rooted at the two nearest N donors and excludes carbon atoms that are
+    too close to Ni or oxygen-bound carboxylate-like atoms.
+    """
+    plane_indices = set(donor_n_indices)
+    adjacency = build_cn_adjacency(elements, coords)
+    queue = list(donor_n_indices)
+    visited = set(donor_n_indices)
+
+    while queue and len(plane_indices) < 16:
+        current_index = queue.pop(0)
+        for neighbor_index in sorted(adjacency[current_index]):
+            if neighbor_index in visited:
+                continue
+            visited.add(neighbor_index)
+
+            if elements[neighbor_index] == "C":
+                ni_distance = calculate_distance(coords, ni_index, neighbor_index)
+                if ni_distance < 2.1:
+                    continue
+                if oxygen_neighbor_count(elements, coords, neighbor_index) >= 1:
+                    continue
+
+            plane_indices.add(neighbor_index)
+            queue.append(neighbor_index)
+
+    if len(plane_indices) >= 3:
+        return sorted(plane_indices)
+
+    fallback_candidates = []
+    for atom_index, element in enumerate(elements):
+        if atom_index in plane_indices or element not in {"C", "N"}:
+            continue
+        if element == "C" and oxygen_neighbor_count(elements, coords, atom_index) >= 1:
+            continue
+        distance = calculate_distance(coords, ni_index, atom_index)
+        if distance >= 2.1:
+            fallback_candidates.append((distance, atom_index))
+
+    fallback_candidates.sort(key=lambda item: (item[0], item[1]))
+    for _, atom_index in fallback_candidates[:10]:
+        plane_indices.add(atom_index)
+        if len(plane_indices) >= 3:
+            break
+
+    return sorted(plane_indices)
+
+
+def point_plane_distance(point: np.ndarray, plane_points: np.ndarray) -> float:
+    """Return the shortest distance from a point to a best-fit plane."""
+    if len(plane_points) < 3:
+        return float("nan")
+
+    centroid = plane_points.mean(axis=0)
+    centered = plane_points - centroid
+    _, singular_values, right_t = np.linalg.svd(centered, full_matrices=False)
+    if len(singular_values) < 2 or singular_values[1] == 0:
+        return float("nan")
+
+    normal = right_t[-1]
+    normal_norm = np.linalg.norm(normal)
+    if normal_norm == 0:
+        return float("nan")
+
+    normal = normal / normal_norm
+    return float(abs(np.dot(point - centroid, normal)))
+
+
+def find_c_beta_index(
+    elements: List[str],
+    coords: np.ndarray,
+    ni_index: int,
+    bpy_plane_indices: List[int],
+) -> Optional[int]:
+    """Infer C_beta as the nearest non-bpy carbon to Ni."""
+    bpy_plane_set = set(bpy_plane_indices)
+    candidates = []
+    fallback_candidates = []
+    for atom_index, element in enumerate(elements):
+        if element != "C" or atom_index in bpy_plane_set:
+            continue
+
+        distance = calculate_distance(coords, ni_index, atom_index)
+        fallback_candidates.append((distance, atom_index))
+        if oxygen_neighbor_count(elements, coords, atom_index) < 2:
+            candidates.append((distance, atom_index))
+
+    selected_candidates = candidates or fallback_candidates
+    if not selected_candidates:
+        return None
+
+    selected_candidates.sort(key=lambda item: (item[0], item[1]))
+    return selected_candidates[0][1]
+
+
+def infer_descriptor_atoms(
+    elements: List[str],
+    coords: np.ndarray,
+) -> Tuple[Dict[str, Any], Optional[str]]:
+    """Infer descriptor atom roles from element-only XYZ coordinates."""
+    ni_indices = [index for index, element in enumerate(elements) if element == "Ni"]
+    if not ni_indices:
+        return {}, "No Ni atom found."
+
+    ni_index = ni_indices[0]
+    donor_n_indices = nearest_atom_indices(elements, coords, ni_index, "N", count=2)
+    if len(donor_n_indices) < 2:
+        return {}, "Fewer than two N atoms found near Ni."
+
+    bpy_plane_indices = collect_bpy_plane_indices(
+        elements,
+        coords,
+        ni_index,
+        donor_n_indices,
+    )
+    o1_indices = nearest_atom_indices(elements, coords, ni_index, "O", count=1)
+    c_beta_index = find_c_beta_index(elements, coords, ni_index, bpy_plane_indices)
+
+    return (
+        {
+            "ni": ni_index,
+            "n_a": donor_n_indices[0],
+            "n_b": donor_n_indices[1],
+            "o1": o1_indices[0] if o1_indices else None,
+            "c_beta": c_beta_index,
+            "bpy_plane": bpy_plane_indices,
+        },
+        None,
+    )
+
+
+def descriptor_atom_summary(elements: List[str], atom_roles: Dict[str, Any]) -> str:
+    """Format inferred atom-role labels for descriptor diagnostics."""
+    labels = [
+        f"Ni={atom_label(elements, atom_roles['ni'])}",
+        f"N_A={atom_label(elements, atom_roles['n_a'])}",
+        f"N_B={atom_label(elements, atom_roles['n_b'])}",
+    ]
+    if atom_roles.get("o1") is not None:
+        labels.append(f"O1={atom_label(elements, atom_roles['o1'])}")
+    if atom_roles.get("c_beta") is not None:
+        labels.append(f"C_beta={atom_label(elements, atom_roles['c_beta'])}")
+    if atom_roles.get("bpy_plane"):
+        labels.append(f"bpy_plane_atoms={len(atom_roles['bpy_plane'])}")
+    return ", ".join(labels)
+
+
+def build_descriptor_record(
+    row: pd.Series,
+    descriptor: dict,
+    value: float,
+    variant: str,
+    xyz_string: str,
+    atom_summary: str,
+) -> dict:
+    """Build one descriptor point record for plotting and tables."""
+    unique_name = str(row.get("unique_name", ""))
+    parsed_name = parse_unique_name(unique_name)
+    return {
+        "descriptor_id": descriptor["id"],
+        "descriptor": descriptor["label"],
+        "role": descriptor["role"],
+        "variant": variant,
+        "value": float(value),
+        "unit": descriptor["unit"],
+        "unique_name": unique_name,
+        "smiles": get_preferred_smiles(row),
+        "xyz": xyz_string,
+        "bipyridine": parsed_name.get("bipyridine"),
+        "alkyne": parsed_name.get("alkyne"),
+        "atom_summary": atom_summary,
+    }
+
+
+def calculate_descriptor_records_for_row(row: pd.Series, descriptor: dict) -> List[dict]:
+    """Calculate one descriptor definition for a molecule row."""
+    xyz_string = get_preferred_xyz(row)
+    if xyz_string is None:
+        return []
+
+    parsed_xyz = parse_xyz_coordinates(xyz_string)
+    if parsed_xyz is None:
+        return []
+
+    elements, coords = parsed_xyz
+    atom_roles, error = infer_descriptor_atoms(elements, coords)
+    if error:
+        return []
+
+    ni_index = atom_roles["ni"]
+    n_a_index = atom_roles["n_a"]
+    n_b_index = atom_roles["n_b"]
+    o1_index = atom_roles.get("o1")
+    c_beta_index = atom_roles.get("c_beta")
+    atom_summary = descriptor_atom_summary(elements, atom_roles)
+
+    records = []
+    descriptor_id = descriptor["id"]
+
+    if descriptor_id == "reactant_n_ni_c_angles":
+        if c_beta_index is None:
+            return []
+        for donor_label, donor_index in (("N_A-Ni-C_beta", n_a_index), ("N_B-Ni-C_beta", n_b_index)):
+            angle_value = calculate_angle(coords, donor_index, ni_index, c_beta_index)
+            if np.isfinite(angle_value):
+                records.append(
+                    build_descriptor_record(
+                        row,
+                        descriptor,
+                        angle_value,
+                        donor_label,
+                        xyz_string,
+                        atom_summary,
+                    )
+                )
+        return records
+
+    if descriptor_id == "product_o1_ni_c_beta_angle":
+        if o1_index is None or c_beta_index is None:
+            return []
+        angle_value = calculate_angle(coords, o1_index, ni_index, c_beta_index)
+        if np.isfinite(angle_value):
+            records.append(
+                build_descriptor_record(
+                    row,
+                    descriptor,
+                    angle_value,
+                    "O1-Ni-C_beta",
+                    xyz_string,
+                    atom_summary,
+                )
+            )
+        return records
+
+    if descriptor_id == "product_mean_n_ni_o1_angle":
+        if o1_index is None:
+            return []
+        angle_values = [
+            calculate_angle(coords, n_a_index, ni_index, o1_index),
+            calculate_angle(coords, n_b_index, ni_index, o1_index),
+        ]
+        if all(np.isfinite(angle_value) for angle_value in angle_values):
+            records.append(
+                build_descriptor_record(
+                    row,
+                    descriptor,
+                    float(np.mean(angle_values)),
+                    "mean(N_A-Ni-O1, N_B-Ni-O1)",
+                    xyz_string,
+                    atom_summary,
+                )
+            )
+        return records
+
+    if descriptor_id == "product_ni_n_distance_difference":
+        distance_delta = abs(
+            calculate_distance(coords, ni_index, n_a_index)
+            - calculate_distance(coords, ni_index, n_b_index)
+        )
+        records.append(
+            build_descriptor_record(
+                row,
+                descriptor,
+                distance_delta,
+                "|Ni-N_A - Ni-N_B|",
+                xyz_string,
+                atom_summary,
+            )
+        )
+        return records
+
+    if descriptor_id == "product_ni_bpy_plane_distance":
+        plane_indices = atom_roles.get("bpy_plane", [])
+        distance = point_plane_distance(coords[ni_index], coords[plane_indices])
+        if np.isfinite(distance):
+            records.append(
+                build_descriptor_record(
+                    row,
+                    descriptor,
+                    distance,
+                    "Ni to bpy plane",
+                    xyz_string,
+                    atom_summary,
+                )
+            )
+
+    return records
+
+
+def descriptor_keyword_text(row: pd.Series) -> str:
+    """Return lowercase searchable text for descriptor keyword filters."""
+    parts = []
+    for column in ("unique_name", "initial_smiles", "opt_smiles", "formula"):
+        value = row.get(column, None)
+        if not is_missing_scalar(value):
+            parts.append(str(value))
+    return " ".join(parts).lower()
+
+
+def row_matches_descriptor_keywords(row: pd.Series, keywords: List[str]) -> bool:
+    """Return True when a row contains every selected descriptor keyword."""
+    if not keywords:
+        return True
+
+    searchable_text = descriptor_keyword_text(row)
+    return all(str(keyword).lower() in searchable_text for keyword in keywords)
+
+
+def extract_descriptor_keyword_options(df: pd.DataFrame, role: str) -> List[str]:
+    """Extract keyword options from parsed ligand names for a role."""
+    if df.empty or "unique_name" not in df.columns:
+        return []
+
+    keywords = set()
+    skipped_tokens = {"reactant", "product", "co2", "bipy", "c2h2"}
+    for unique_name in df["unique_name"].dropna().astype(str).unique():
+        parsed_name = parse_unique_name(unique_name)
+        if parsed_name.get("role") != role:
+            continue
+
+        for key in ("bipyridine", "alkyne"):
+            value = parsed_name.get(key)
+            if value:
+                keywords.add(str(value))
+
+        for token in re.split(r"[^A-Za-z0-9+-]+", unique_name):
+            normalized = token.strip()
+            if len(normalized) < 2 or normalized.lower() in skipped_tokens:
+                continue
+            keywords.add(normalized)
+
+    return sorted(keywords, key=lambda keyword: keyword.lower())
+
+
+def build_descriptor_dataframe(
+    df: pd.DataFrame,
+    reactant_keywords: Optional[List[str]] = None,
+    product_keywords: Optional[List[str]] = None,
+) -> pd.DataFrame:
+    """Calculate all supported descriptor records for matching reactants and products."""
+    columns = [
+        "descriptor_id",
+        "descriptor",
+        "role",
+        "variant",
+        "value",
+        "unit",
+        "unique_name",
+        "smiles",
+        "xyz",
+        "bipyridine",
+        "alkyne",
+        "atom_summary",
+    ]
+    if df.empty or "unique_name" not in df.columns:
+        return pd.DataFrame(columns=columns)
+
+    reactant_keywords = reactant_keywords or []
+    product_keywords = product_keywords or []
+    records = []
+
+    for _, row in df.iterrows():
+        unique_name = row.get("unique_name", None)
+        if is_missing_scalar(unique_name):
+            continue
+
+        role = parse_unique_name(str(unique_name)).get("role")
+        if role not in {"reactant", "product"}:
+            continue
+
+        if role == "reactant":
+            if not row_matches_descriptor_keywords(row, reactant_keywords):
+                continue
+        elif not row_matches_descriptor_keywords(row, product_keywords):
+            continue
+
+        for descriptor in DESCRIPTOR_DEFINITIONS:
+            if descriptor["role"] != role:
+                continue
+            records.extend(calculate_descriptor_records_for_row(row, descriptor))
+
+    return pd.DataFrame(records, columns=columns)
+
+
+def build_descriptor_hover_html(
+    descriptor_records: pd.DataFrame,
+    title: str,
+    unit_label: str,
+) -> str:
+    """Build a self-contained hover plot with a 3Dmol geometry preview panel."""
+    points = []
+    for point_index, (_, row) in enumerate(descriptor_records.reset_index(drop=True).iterrows()):
+        points.append(
+            {
+                "index": point_index,
+                "x": point_index + 1,
+                "value": float(row["value"]),
+                "name": str(row.get("unique_name", "")),
+                "smiles": str(row.get("smiles", "")),
+                "xyz": str(row.get("xyz", "")),
+                "variant": str(row.get("variant", "")),
+                "descriptor": str(row.get("descriptor", "")),
+                "atomSummary": str(row.get("atom_summary", "")),
+            }
+        )
+
+    points_json = json.dumps(points).replace("</", "<\\/")
+    escaped_title = html.escape(title)
+    escaped_unit = html.escape(unit_label)
+
+    return f"""
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>
+  <script src="https://3Dmol.org/build/3Dmol-min.js"></script>
+  <style>
+    body {{
+      margin: 0;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      color: #17202a;
+    }}
+    .descriptor-shell {{
+      display: grid;
+      grid-template-columns: minmax(0, 1.35fr) minmax(320px, 0.65fr);
+      gap: 14px;
+      min-height: 560px;
+    }}
+    #descriptor-plot {{
+      min-height: 560px;
+      border: 1px solid #d7dde5;
+      border-radius: 8px;
+    }}
+    .preview-panel {{
+      border: 1px solid #d7dde5;
+      border-radius: 8px;
+      padding: 12px;
+      min-width: 0;
+    }}
+    .preview-title {{
+      font-weight: 650;
+      font-size: 15px;
+      margin-bottom: 6px;
+      overflow-wrap: anywhere;
+    }}
+    .preview-meta {{
+      font-size: 12px;
+      color: #4f5b66;
+      line-height: 1.45;
+      margin-bottom: 10px;
+      overflow-wrap: anywhere;
+    }}
+    #descriptor-viewer {{
+      height: 390px;
+      width: 100%;
+      background: #ffffff;
+      border: 1px solid #e3e8ef;
+      border-radius: 6px;
+      position: relative;
+    }}
+    .viewer-message {{
+      padding: 14px;
+      color: #5d6875;
+      font-size: 13px;
+    }}
+    @media (max-width: 760px) {{
+      .descriptor-shell {{
+        grid-template-columns: 1fr;
+      }}
+    }}
+  </style>
+</head>
+<body>
+  <div class="descriptor-shell">
+    <div id="descriptor-plot"></div>
+    <div class="preview-panel">
+      <div class="preview-title" id="preview-name">Hover a point</div>
+      <div class="preview-meta">
+        <div><strong>SMILES:</strong> <span id="preview-smiles"></span></div>
+        <div><strong>Value:</strong> <span id="preview-value"></span></div>
+        <div><strong>Atoms:</strong> <span id="preview-atoms"></span></div>
+      </div>
+      <div id="descriptor-viewer">
+        <div class="viewer-message">Hover a plotted molecule to load its geometry.</div>
+      </div>
+    </div>
+  </div>
+  <script>
+    const points = {points_json};
+    const plotEl = document.getElementById("descriptor-plot");
+    const viewerEl = document.getElementById("descriptor-viewer");
+    let viewer = null;
+
+    function groupByVariant(items) {{
+      const groups = new Map();
+      for (const point of items) {{
+        const key = point.variant || "Value";
+        if (!groups.has(key)) {{
+          groups.set(key, []);
+        }}
+        groups.get(key).push(point);
+      }}
+      return groups;
+    }}
+
+    function renderPoint(point) {{
+      document.getElementById("preview-name").textContent = point.name || "Unnamed molecule";
+      document.getElementById("preview-smiles").textContent = point.smiles || "N/A";
+      document.getElementById("preview-value").textContent =
+        `${{point.value.toFixed(4)}} {escaped_unit} (${{point.variant || "value"}})`;
+      document.getElementById("preview-atoms").textContent = point.atomSummary || "N/A";
+
+      if (!point.xyz) {{
+        viewerEl.innerHTML = '<div class="viewer-message">No XYZ geometry available.</div>';
+        viewer = null;
+        return;
+      }}
+
+      if (!window.$3Dmol) {{
+        viewerEl.innerHTML =
+          '<div class="viewer-message">3Dmol.js is unavailable, but hover data is loaded.</div>';
+        viewer = null;
+        return;
+      }}
+
+      viewerEl.innerHTML = "";
+      viewer = window.$3Dmol.createViewer(viewerEl, {{ backgroundColor: "white" }});
+      viewer.addModel(point.xyz, "xyz");
+      viewer.setStyle({{}}, {{ stick: {{ radius: 0.16 }}, sphere: {{ scale: 0.24 }} }});
+      viewer.zoomTo();
+      viewer.render();
+    }}
+
+    const traces = [];
+    for (const [variant, group] of groupByVariant(points).entries()) {{
+      traces.push({{
+        x: group.map((point) => point.x),
+        y: group.map((point) => point.value),
+        mode: "markers",
+        type: "scattergl",
+        name: variant,
+        marker: {{
+          size: 9,
+          opacity: 0.82,
+          line: {{ width: 0.5, color: "#243447" }}
+        }},
+        customdata: group.map((point) => [
+          point.index,
+          point.name,
+          point.smiles,
+          point.variant,
+          point.atomSummary
+        ]),
+        hovertemplate:
+          "<b>%{{customdata[1]}}</b><br>" +
+          "SMILES: %{{customdata[2]}}<br>" +
+          "Variant: %{{customdata[3]}}<br>" +
+          "Value: %{{y:.4f}} {escaped_unit}<br>" +
+          "Atoms: %{{customdata[4]}}<extra></extra>"
+      }});
+    }}
+
+    Plotly.newPlot(
+      plotEl,
+      traces,
+      {{
+        title: "{escaped_title}",
+        xaxis: {{ title: "Molecule", showticklabels: false, zeroline: false }},
+        yaxis: {{ title: "{escaped_title} ({escaped_unit})", zeroline: false }},
+        hovermode: "closest",
+        margin: {{ l: 68, r: 24, t: 54, b: 52 }},
+        legend: {{ orientation: "h", y: -0.16 }},
+        paper_bgcolor: "white",
+        plot_bgcolor: "white"
+      }},
+      {{ responsive: true, displayModeBar: true }}
+    );
+
+    plotEl.on("plotly_hover", (eventData) => {{
+      if (!eventData.points || !eventData.points.length) {{
+        return;
+      }}
+      const pointIndex = eventData.points[0].customdata[0];
+      renderPoint(points[pointIndex]);
+    }});
+
+    if (points.length > 0) {{
+      renderPoint(points[0]);
+    }}
+  </script>
+</body>
+</html>
+"""
 
 
 def create_ir_spectrum_plot(
@@ -2648,14 +3378,15 @@ def main(data_paths: Optional[List[str]] = None):
     show_comparison_tab = parquet_files_have_same_dimensions(comparison_file_summaries)
 
     # Create tabs
-    tab_labels = ["🔬 Single Calculation", "📊 Dataset Analytics"]
+    tab_labels = ["🔬 Single Calculation", "📊 Dataset Analytics", "📐 Descriptors"]
     if show_comparison_tab:
         tab_labels.append("🔁 Comparison")
     tab_labels.append("⚗️ Reactions")
     tabs = st.tabs(tab_labels)
     tab1 = tabs[0]
     tab2 = tabs[1]
-    comparison_tab = tabs[2] if show_comparison_tab else None
+    descriptors_tab = tabs[2]
+    comparison_tab = tabs[3] if show_comparison_tab else None
     tab3 = tabs[-1]
 
     # ========================================================================
@@ -3358,6 +4089,189 @@ def main(data_paths: Optional[List[str]] = None):
             st.info("IR spectrum data not available in dataset.")
 
     # ========================================================================
+    # Tab 3: Geometry Descriptors
+    # ========================================================================
+    with descriptors_tab:
+        st.subheader("Geometry Descriptors")
+
+        with st.spinner("Loading data for descriptors..."):
+            descriptor_source_df = data_manager.get_filtered_data(
+                formula=st.session_state.get("filter_formula", None),
+                opt_converged=st.session_state.get("filter_converged", None),
+                smiles_changed=st.session_state.get("filter_smiles_changed", None),
+                number_of_imaginary_max=st.session_state.get("filter_max_imag", None),
+                text_filter=(
+                    st.session_state.get("filter_text", "")
+                    if st.session_state.get("filter_text", "")
+                    else None
+                ),
+                limit=None,
+            )
+
+        if descriptor_source_df.empty:
+            st.warning("No descriptor data available with current filters.")
+            st.info("Try adjusting filters or uploading reaction-like Ni complex data.")
+        elif "unique_name" not in descriptor_source_df.columns:
+            st.error("Dataset does not contain 'unique_name' column.")
+        else:
+            reactant_keyword_options = extract_descriptor_keyword_options(
+                descriptor_source_df,
+                "reactant",
+            )
+            product_keyword_options = extract_descriptor_keyword_options(
+                descriptor_source_df,
+                "product",
+            )
+
+            control_col1, control_col2, control_col3 = st.columns([2, 2, 1])
+            with control_col1:
+                selected_reactant_keywords = st.multiselect(
+                    "Reactant keyword filters",
+                    options=reactant_keyword_options,
+                    key="descriptor_reactant_keywords",
+                    help=(
+                        "Reactant rows must contain every selected keyword in "
+                        "unique_name, formula, or SMILES."
+                    ),
+                )
+            with control_col2:
+                selected_product_keywords = st.multiselect(
+                    "Product keyword filters",
+                    options=product_keyword_options,
+                    key="descriptor_product_keywords",
+                    help=(
+                        "Product rows must contain every selected keyword in "
+                        "unique_name, formula, or SMILES."
+                    ),
+                )
+            with control_col3:
+                max_descriptor_points = st.number_input(
+                    "Max plot points",
+                    min_value=25,
+                    max_value=5000,
+                    value=500,
+                    step=25,
+                    help="Maximum XYZ-bearing points embedded in each hover plot.",
+                )
+
+            with st.spinner("Calculating descriptors..."):
+                descriptor_df = build_descriptor_dataframe(
+                    descriptor_source_df,
+                    reactant_keywords=selected_reactant_keywords,
+                    product_keywords=selected_product_keywords,
+                )
+
+            if descriptor_df.empty:
+                st.warning(
+                    "No descriptor values could be calculated for the current filters."
+                )
+                st.info(
+                    "Descriptor calculation requires Ni, two nearby N atoms, and "
+                    "descriptor-specific C/O atoms in initial or optimized XYZ data."
+                )
+            else:
+                metric_col1, metric_col2, metric_col3 = st.columns(3)
+                with metric_col1:
+                    st.metric(
+                        "Descriptor Points",
+                        int(len(descriptor_df)),
+                    )
+                with metric_col2:
+                    st.metric(
+                        "Reactant Molecules",
+                        int(
+                            descriptor_df[descriptor_df["role"] == "reactant"][
+                                "unique_name"
+                            ].nunique()
+                        ),
+                    )
+                with metric_col3:
+                    st.metric(
+                        "Product Molecules",
+                        int(
+                            descriptor_df[descriptor_df["role"] == "product"][
+                                "unique_name"
+                            ].nunique()
+                        ),
+                    )
+
+                st.markdown("---")
+                st.subheader("Descriptor Plots")
+                descriptor_tabs = st.tabs(
+                    [descriptor["label"] for descriptor in DESCRIPTOR_DEFINITIONS]
+                )
+                for descriptor_tab, descriptor in zip(
+                    descriptor_tabs,
+                    DESCRIPTOR_DEFINITIONS,
+                ):
+                    with descriptor_tab:
+                        descriptor_records = descriptor_df[
+                            descriptor_df["descriptor_id"] == descriptor["id"]
+                        ].copy()
+                        if descriptor_records.empty:
+                            st.info(
+                                f"No {descriptor['label']} values for the current filters."
+                            )
+                            continue
+
+                        descriptor_records = descriptor_records.sort_values(
+                            ["variant", "unique_name", "value"],
+                            kind="stable",
+                        ).reset_index(drop=True)
+                        plotted_records = descriptor_records.head(
+                            int(max_descriptor_points)
+                        )
+                        if len(plotted_records) < len(descriptor_records):
+                            st.info(
+                                f"Showing {len(plotted_records):,} of "
+                                f"{len(descriptor_records):,} descriptor points. "
+                                "Increase Max plot points to embed more geometries."
+                            )
+
+                        unit_label = format_descriptor_unit(descriptor["unit"])
+                        descriptor_html = build_descriptor_hover_html(
+                            plotted_records,
+                            descriptor["label"],
+                            unit_label,
+                        )
+                        components.html(
+                            descriptor_html,
+                            height=650,
+                            scrolling=False,
+                        )
+
+                        table_display = descriptor_records[
+                            [
+                                "unique_name",
+                                "smiles",
+                                "variant",
+                                "value",
+                                "unit",
+                                "bipyridine",
+                                "alkyne",
+                                "atom_summary",
+                            ]
+                        ].copy()
+                        table_display["unit"] = table_display["unit"].map(
+                            format_descriptor_unit
+                        )
+                        table_display.columns = [
+                            "Molecule",
+                            "SMILES",
+                            "Variant",
+                            "Value",
+                            "Unit",
+                            "Bipyridine",
+                            "Alkyne",
+                            "Inferred Atoms",
+                        ]
+                        st.dataframe(
+                            table_display,
+                            use_container_width=True,
+                            hide_index=True,
+                        )
+
+    # ========================================================================
     # Comparison Tab: File-aware row comparison
     # ========================================================================
     if comparison_tab is not None:
@@ -3768,7 +4682,7 @@ def main(data_paths: Optional[List[str]] = None):
                                 )
 
     # ========================================================================
-    # Tab 3: Reactions
+    # Tab 4: Reactions
     # ========================================================================
 
     with tab3:

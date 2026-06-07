@@ -17,6 +17,7 @@ from iqc_dashboard.app import (
     create_vibrational_stick_plot,
     normalize_spectrum_intensities,
     normalize_vibrational_frequencies,
+    parse_xyz_coordinates,
     render_molecule,
     set_molecule_style,
 )
@@ -165,6 +166,17 @@ class TestRenderMolecule:
         assert not summary["bond_changes"].empty
         assert not summary["angle_changes"].empty
         assert not summary["dihedral_changes"].empty
+
+    def test_parse_xyz_coordinates_preserves_blank_comment_line(self):
+        """Test standard XYZ with an empty comment line keeps the first atom."""
+        xyz = "3\n\nNi 0.0 0.0 0.0\nN 1.0 0.0 0.0\nN -1.0 0.0 0.0\n"
+
+        result = parse_xyz_coordinates(xyz)
+
+        assert result is not None
+        elements, coords = result
+        assert elements == ["Ni", "N", "N"]
+        assert coords.shape == (3, 3)
 
     def test_build_geometry_optimization_summary_requires_matching_atoms(self):
         """Test geometry summary returns None when atom lists do not match."""
