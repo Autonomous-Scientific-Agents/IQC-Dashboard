@@ -1073,6 +1073,47 @@ def format_comparison_molecule_label(comparison_key: str, occurrence: int) -> st
     return label
 
 
+def build_comparison_match_options(matched_rows: pd.DataFrame) -> pd.DataFrame:
+    """Return one selectable comparison match per initial row in source row order."""
+    option_columns = [
+        "_comparison_match_id",
+        "_comparison_key",
+        "_comparison_occurrence",
+        "_comparison_molecule_label",
+    ]
+    required_columns = option_columns + [
+        "_comparison_file_order",
+        "_comparison_row_number",
+    ]
+    if matched_rows.empty or any(
+        column not in matched_rows.columns for column in required_columns
+    ):
+        return pd.DataFrame(columns=option_columns)
+
+    return (
+        matched_rows.sort_values(
+            [
+                "_comparison_file_order",
+                "_comparison_row_number",
+                "_comparison_molecule_label",
+                "_comparison_match_id",
+            ],
+            kind="stable",
+        )
+        .drop_duplicates("_comparison_match_id", keep="first")
+        .sort_values(
+            [
+                "_comparison_file_order",
+                "_comparison_row_number",
+                "_comparison_molecule_label",
+                "_comparison_match_id",
+            ],
+            kind="stable",
+        )[option_columns]
+        .reset_index(drop=True)
+    )
+
+
 def get_comparison_numeric_columns(matched_rows: pd.DataFrame) -> List[str]:
     """Return original columns that can be compared numerically."""
     if matched_rows.empty:
@@ -3454,19 +3495,7 @@ def main(data_paths: Optional[List[str]] = None):
                             st.markdown("---")
                             st.subheader("Matched Row Details")
 
-                            match_options = (
-                                matched_rows[
-                                    [
-                                        "_comparison_match_id",
-                                        "_comparison_key",
-                                        "_comparison_occurrence",
-                                        "_comparison_molecule_label",
-                                    ]
-                                ]
-                                .drop_duplicates()
-                                .sort_values("_comparison_molecule_label")
-                                .reset_index(drop=True)
-                            )
+                            match_options = build_comparison_match_options(matched_rows)
                             comparison_match_ids = match_options[
                                 "_comparison_match_id"
                             ].tolist()
@@ -3518,7 +3547,7 @@ def main(data_paths: Optional[List[str]] = None):
                                 [1, 2, 1]
                             )
                             with nav_col_left:
-                                if st.button(
+                                st.button(
                                     "⬅️ Previous",
                                     use_container_width=True,
                                     disabled=(
@@ -3529,15 +3558,14 @@ def main(data_paths: Optional[List[str]] = None):
                                     ),
                                     on_click=_go_comparison_prev,
                                     key="comparison_prev_button",
-                                ):
-                                    st.rerun()
+                                )
                             with nav_col_center:
                                 st.write(
                                     f"{st.session_state['comparison_selected_match_index'] + 1} "
                                     f"of {len(comparison_match_ids)}"
                                 )
                             with nav_col_right:
-                                if st.button(
+                                st.button(
                                     "Next ➡️",
                                     use_container_width=True,
                                     disabled=(
@@ -3548,9 +3576,11 @@ def main(data_paths: Optional[List[str]] = None):
                                     ),
                                     on_click=_go_comparison_next,
                                     key="comparison_next_button",
-                                ):
-                                    st.rerun()
+                                )
 
+                            selected_match_id = st.session_state[
+                                "comparison_selected_match_id"
+                            ]
                             selected_rows = matched_rows[
                                 matched_rows["_comparison_match_id"] == selected_match_id
                             ]
