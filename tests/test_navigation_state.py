@@ -11,6 +11,7 @@ import pandas as pd
 from iqc_dashboard.app import (
     build_comparison_match_options,
     build_comparison_match_id,
+    build_reaction_selection_options,
     move_indexed_selection,
     sync_indexed_selection,
 )
@@ -137,3 +138,32 @@ def test_comparison_next_moves_to_next_source_row_match():
     assert result == 1
     assert state["comparison_selected_match_index"] == 1
     assert state["comparison_selected_match_id"] == comparison_match_ids[1]
+
+
+def test_reaction_selection_options_keep_duplicate_ligand_pairs():
+    """Test reaction navigation exposes each reaction row, not one row per ligand pair."""
+    delta_df = pd.DataFrame(
+        [
+            {
+                "bipyridine": "bipy_a",
+                "alkyne": "alkyl_a",
+                "unique_name_reactant": "reactant_a_conf1",
+                "unique_name_product": "product_a_conf1",
+                "deltaG": -2.5,
+            },
+            {
+                "bipyridine": "bipy_a",
+                "alkyne": "alkyl_a",
+                "unique_name_reactant": "reactant_a_conf2",
+                "unique_name_product": "product_a_conf2",
+                "deltaG": -1.5,
+            },
+        ]
+    )
+
+    options = build_reaction_selection_options(delta_df)
+
+    assert options["_reaction_option_id"].tolist() == ["reaction:0", "reaction:1"]
+    assert options["_reaction_position"].tolist() == [0, 1]
+    assert "reactant_a_conf1 -> product_a_conf1" in options["_reaction_label"].iloc[0]
+    assert "reactant_a_conf2 -> product_a_conf2" in options["_reaction_label"].iloc[1]

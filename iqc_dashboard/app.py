@@ -3323,6 +3323,240 @@ def calculate_reaction_gibbs(
     return delta
 
 
+def convert_reaction_gibbs_kcal(value, energy_unit: str) -> Optional[float]:
+    """Convert a precomputed reaction Gibbs value from kcal/mol to display units."""
+    if is_missing_scalar(value):
+        return None
+
+    value = float(value)
+    if energy_unit == ENERGY_UNIT_EV:
+        return value / EV_TO_KCAL_MOL
+    return value
+
+
+def first_non_missing_value(series: pd.Series):
+    """Return the first non-null scalar from a series."""
+    for value in series:
+        if not is_missing_scalar(value):
+            return value
+    return None
+
+
+def build_precomputed_reaction_row(
+    reaction_rows: pd.DataFrame,
+    energy_unit: str,
+) -> Optional[dict]:
+    """Build one reaction table row from JSON-derived reactant/product rows."""
+    reaction_gibbs_kcal = first_non_missing_value(reaction_rows["reaction_gibbs_kcal"])
+    delta_g = convert_reaction_gibbs_kcal(reaction_gibbs_kcal, energy_unit)
+    if delta_g is None:
+        return None
+
+    reactant_rows = reaction_rows[reaction_rows.get("reaction_role") == "reactant"]
+    product_rows = reaction_rows[reaction_rows.get("reaction_role") == "product"]
+    if reactant_rows.empty or product_rows.empty:
+        return None
+
+    reactant_row = reactant_rows.iloc[0]
+    product_row = product_rows.iloc[0]
+    parsed_name = parse_unique_name(str(reactant_row.get("unique_name", "")))
+
+    return {
+        "bipyridine": parsed_name.get("bipyridine"),
+        "alkyne": parsed_name.get("alkyne"),
+        "G_reactant": reactant_row.get("source_gibbs", np.nan),
+        "G_product": product_row.get("source_gibbs", np.nan),
+        "G_CO2": np.nan,
+        "deltaG": delta_g,
+        "reaction_gibbs_kcal": float(reaction_gibbs_kcal),
+        "unique_name_reactant": reactant_row.get("unique_name", ""),
+        "unique_name_product": product_row.get("unique_name", ""),
+        "stereo_type": first_non_missing_value(reaction_rows.get("stereo_type", pd.Series())),
+        "insertion_type": first_non_missing_value(
+            reaction_rows.get("insertion_type", pd.Series())
+        ),
+        "reaction_data_source": "precomputed_json",
+    }
+
+
+def calculate_precomputed_reaction_gibbs(
+    df: pd.DataFrame,
+    energy_unit: str = ENERGY_UNIT_KCAL,
+) -> pd.DataFrame:
+    """Build a reaction table from JSON data with precomputed reaction_gibbs_kcal."""
+    if df.empty or "reaction_gibbs_kcal" not in df.columns:
+        return pd.DataFrame()
+
+    required_columns = {"source_json_row", "reaction_role", "unique_name"}
+    if not required_columns.issubset(df.columns):
+        return pd.DataFrame()
+
+    work = df.reset_index(drop=True).copy()
+    work["_source_order"] = np.arange(len(work))
+    if "source_gibbs" not in work.columns:
+        work["source_gibbs"] = np.nan
+
+    work["_reaction_gibbs_kcal_numeric"] = pd.to_numeric(
+        work["reaction_gibbs_kcal"],
+        errors="coerce",
+    )
+    gibbs_rows = work[work["_reaction_gibbs_kcal_numeric"].notna()]
+    if gibbs_rows.empty:
+        return pd.DataFrame()
+
+    base_rows = (
+        gibbs_rows.sort_values("_source_order", kind="stable")[
+            ["source_json_row", "_reaction_gibbs_kcal_numeric"]
+        ]
+        .drop_duplicates("source_json_row", keep="first")
+        .reset_index(drop=True)
+    )
+
+    role_series = work["reaction_role"].astype(str).str.lower()
+    reactant_rows = (
+        work[role_series == "reactant"]
+        .sort_values("_source_order", kind="stable")[
+            ["source_json_row", "unique_name", "source_gibbs"]
+        ]
+        .drop_duplicates("source_json_row", keep="first")
+        .rename(
+            columns={
+                "unique_name": "unique_name_reactant",
+                "source_gibbs": "G_reactant",
+            }
+        )
+    )
+    product_rows = (
+        work[role_series == "product"]
+        .sort_values("_source_order", kind="stable")[
+            ["source_json_row", "unique_name", "source_gibbs"]
+        ]
+        .drop_duplicates("source_json_row", keep="first")
+        .rename(
+            columns={
+                "unique_name": "unique_name_product",
+                "source_gibbs": "G_product",
+            }
+        )
+    )
+
+    delta = (
+        base_rows.merge(reactant_rows, on="source_json_row", how="inner", sort=False)
+        .merge(product_rows, on="source_json_row", how="inner", sort=False)
+    )
+    if delta.empty:
+        return pd.DataFrame()
+
+    metadata_columns = [
+        column for column in ("stereo_type", "insertion_type") if column in work.columns
+    ]
+    if metadata_columns:
+        metadata = (
+            work.sort_values("_source_order", kind="stable")
+            .groupby("source_json_row", sort=False)[metadata_columns]
+            .first()
+            .reset_index()
+        )
+        delta = delta.merge(metadata, on="source_json_row", how="left", sort=False)
+
+    parsed_names = delta["unique_name_reactant"].astype(str).apply(parse_unique_name)
+    parsed_df = pd.DataFrame(parsed_names.tolist(), index=delta.index)
+
+    if energy_unit == ENERGY_UNIT_EV:
+        delta_g = delta["_reaction_gibbs_kcal_numeric"] / EV_TO_KCAL_MOL
+    else:
+        delta_g = delta["_reaction_gibbs_kcal_numeric"]
+
+    result = pd.DataFrame(
+        {
+            "bipyridine": parsed_df.get("bipyridine"),
+            "alkyne": parsed_df.get("alkyne"),
+            "G_reactant": delta["G_reactant"],
+            "G_product": delta["G_product"],
+            "G_CO2": np.nan,
+            "deltaG": delta_g.astype(float),
+            "reaction_gibbs_kcal": delta["_reaction_gibbs_kcal_numeric"].astype(float),
+            "unique_name_reactant": delta["unique_name_reactant"],
+            "unique_name_product": delta["unique_name_product"],
+            "stereo_type": (
+                delta["stereo_type"] if "stereo_type" in delta.columns else None
+            ),
+            "insertion_type": (
+                delta["insertion_type"] if "insertion_type" in delta.columns else None
+            ),
+            "reaction_data_source": "precomputed_json",
+        }
+    )
+
+    return result
+
+
+def calculate_reaction_table(
+    df: pd.DataFrame,
+    energy_unit: str = ENERGY_UNIT_KCAL,
+) -> pd.DataFrame:
+    """Calculate or load reaction Gibbs values from supported data schemas."""
+    if "G_eV" in df.columns:
+        delta_df = calculate_reaction_gibbs(df, energy_unit=energy_unit)
+        delta_df["reaction_data_source"] = "computed_from_g_eV"
+        return delta_df
+
+    if "reaction_gibbs_kcal" in df.columns:
+        return calculate_precomputed_reaction_gibbs(df, energy_unit=energy_unit)
+
+    raise ValueError(
+        "Dataset must contain either 'G_eV' or precomputed 'reaction_gibbs_kcal'."
+    )
+
+
+def format_optional_number(value, digits: int = 4) -> str:
+    """Format a numeric value, or N/A when unavailable."""
+    if is_missing_scalar(value):
+        return "N/A"
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return str(value)
+    if not np.isfinite(value):
+        return "N/A"
+    return f"{value:.{digits}f}"
+
+
+def build_reaction_selection_options(
+    delta_df: pd.DataFrame,
+    energy_unit: str = ENERGY_UNIT_KCAL,
+) -> pd.DataFrame:
+    """Return one selectable option for each reaction row in display order."""
+    option_columns = [
+        "_reaction_option_id",
+        "_reaction_label",
+        "_reaction_position",
+    ]
+    if delta_df.empty:
+        return pd.DataFrame(columns=option_columns)
+
+    options = []
+    for position, (_, reaction) in enumerate(delta_df.reset_index(drop=True).iterrows()):
+        reactant_name = reaction.get("unique_name_reactant", "N/A")
+        product_name = reaction.get("unique_name_product", "N/A")
+        delta_g = format_optional_number(reaction.get("deltaG"))
+
+        label = (
+            f"Reaction {position + 1}: ΔG {delta_g} {energy_unit} | "
+            f"{shorten_comparison_text(reactant_name, 55)} -> "
+            f"{shorten_comparison_text(product_name, 55)}"
+        )
+        options.append(
+            {
+                "_reaction_option_id": f"reaction:{position}",
+                "_reaction_label": label,
+                "_reaction_position": position,
+            }
+        )
+
+    return pd.DataFrame(options, columns=option_columns)
+
+
 def build_ligand_selector_df(df: pd.DataFrame) -> pd.DataFrame:
     """
     Build a selector dataframe for reaction-like entries with parsed ligand metadata.
@@ -3459,7 +3693,7 @@ def main(data_paths: Optional[List[str]] = None):
                 st.session_state.filter_text = ""
 
             # Reset filters button
-            if st.button("🔄 Reset All Filters", use_container_width=True):
+            if st.button("🔄 Reset All Filters", width="stretch"):
                 st.session_state.filter_formula = None
                 st.session_state.filter_converged = None
                 st.session_state.filter_smiles_changed = None
@@ -3872,7 +4106,7 @@ def main(data_paths: Optional[List[str]] = None):
                         else:
                             st.dataframe(
                                 change_df,
-                                use_container_width=True,
+                                width="stretch",
                                 hide_index=True,
                             )
 
@@ -3897,7 +4131,7 @@ def main(data_paths: Optional[List[str]] = None):
 
                     with col_vib1:
                         if fig_vib is not None:
-                            st.plotly_chart(fig_vib, use_container_width=True)
+                            st.plotly_chart(fig_vib, width="stretch")
                         else:
                             st.info("No IR spectrum data available for this calculation.")
 
@@ -3905,7 +4139,7 @@ def main(data_paths: Optional[List[str]] = None):
                         if not freq_table.empty:
                             st.dataframe(
                                 freq_table,
-                                use_container_width=True,
+                                width="stretch",
                                 hide_index=True,
                             )
                         else:
@@ -3961,7 +4195,7 @@ def main(data_paths: Optional[List[str]] = None):
                     with nav_col_left:
                         if st.button(
                             "⬅️ Previous",
-                            use_container_width=True,
+                            width="stretch",
                             disabled=current_index == 0,
                             on_click=_go_prev,
                         ):
@@ -3973,7 +4207,7 @@ def main(data_paths: Optional[List[str]] = None):
                     with nav_col_right:
                         if st.button(
                             "Next ➡️",
-                            use_container_width=True,
+                            width="stretch",
                             disabled=current_index == len(single_calc_molecule_names) - 1,
                             on_click=_go_next,
                         ):
@@ -3985,7 +4219,7 @@ def main(data_paths: Optional[List[str]] = None):
                 all_data_df = build_all_data_table(molecule_data, energy_unit)
                 st.dataframe(
                     all_data_df,
-                    use_container_width=True,
+                    width="stretch",
                     hide_index=True,
                 )
             else:
@@ -4052,7 +4286,7 @@ def main(data_paths: Optional[List[str]] = None):
                     schema_display = schema.iloc[:, :2].copy()
                     schema_display.columns = ["Column Name", "Data Type"]
 
-                st.dataframe(schema_display, use_container_width=True)
+                st.dataframe(schema_display, width="stretch")
             else:
                 st.info("Schema information not available.")
 
@@ -4127,7 +4361,7 @@ def main(data_paths: Optional[List[str]] = None):
                     name="y=x",
                 )
             )
-            st.plotly_chart(fig_scatter, use_container_width=True)
+            st.plotly_chart(fig_scatter, width="stretch")
         else:
             st.warning("Energy columns not available in dataset.")
 
@@ -4141,7 +4375,7 @@ def main(data_paths: Optional[List[str]] = None):
                 labels={"opt_time": "Optimization Time (seconds)", "count": "Frequency"},
                 title="Distribution of Optimization Times",
             )
-            st.plotly_chart(fig_hist, use_container_width=True)
+            st.plotly_chart(fig_hist, width="stretch")
         else:
             st.warning("Optimization time data not available.")
 
@@ -4155,7 +4389,7 @@ def main(data_paths: Optional[List[str]] = None):
                 labels={"number_of_atoms": "Number of Atoms", "count": "Frequency"},
                 title="Distribution of Number of Atoms",
             )
-            st.plotly_chart(fig_atoms, use_container_width=True)
+            st.plotly_chart(fig_atoms, width="stretch")
         else:
             st.warning("Number of atoms data not available.")
 
@@ -4168,7 +4402,7 @@ def main(data_paths: Optional[List[str]] = None):
                 names=["Converged" if x else "Not Converged" for x in convergence_counts.index],
                 title="Convergence Status Distribution",
             )
-            st.plotly_chart(fig_pie, use_container_width=True)
+            st.plotly_chart(fig_pie, width="stretch")
         else:
             st.warning("Convergence data not available.")
 
@@ -4182,7 +4416,7 @@ def main(data_paths: Optional[List[str]] = None):
                 labels={"number_of_electrons": "Number of Electrons", "count": "Frequency"},
                 title="Distribution of Number of Electrons",
             )
-            st.plotly_chart(fig_electrons, use_container_width=True)
+            st.plotly_chart(fig_electrons, width="stretch")
         else:
             st.warning("Number of electrons data not available.")
 
@@ -4203,7 +4437,7 @@ def main(data_paths: Optional[List[str]] = None):
                     labels={"initial_sym_number": "Initial Symmetry Number", "count": "Frequency"},
                     title="Distribution of Initial Symmetry Numbers",
                 )
-                st.plotly_chart(fig_init_sym, use_container_width=True)
+                st.plotly_chart(fig_init_sym, width="stretch")
             else:
                 st.warning("Initial symmetry number data not available.")
         
@@ -4220,7 +4454,7 @@ def main(data_paths: Optional[List[str]] = None):
                     labels={"opt_sym_number": "Optimized Symmetry Number", "count": "Frequency"},
                     title="Distribution of Optimized Symmetry Numbers",
                 )
-                st.plotly_chart(fig_opt_sym, use_container_width=True)
+                st.plotly_chart(fig_opt_sym, width="stretch")
             else:
                 st.warning("Optimized symmetry number data not available.")
 
@@ -4270,7 +4504,7 @@ def main(data_paths: Optional[List[str]] = None):
                 height=700,
                 width=800,
             )
-            st.plotly_chart(fig_corr, use_container_width=True)
+            st.plotly_chart(fig_corr, width="stretch")
         else:
             st.info("Not enough numerical columns for correlation analysis.")
 
@@ -4300,7 +4534,7 @@ def main(data_paths: Optional[List[str]] = None):
                 )
 
                 if fig_vib is not None:
-                    st.plotly_chart(fig_vib, use_container_width=True)
+                    st.plotly_chart(fig_vib, width="stretch")
                 else:
                     st.info(
                         "No IR spectrum or vibrational frequency data available "
@@ -4490,7 +4724,7 @@ def main(data_paths: Optional[List[str]] = None):
                         ]
                         st.dataframe(
                             table_display,
-                            use_container_width=True,
+                            width="stretch",
                             hide_index=True,
                         )
 
@@ -4505,7 +4739,7 @@ def main(data_paths: Optional[List[str]] = None):
                 ["file", "rows", "columns", "error"]
             ].copy()
             display_summary.columns = ["File", "Rows", "Columns", "Error"]
-            st.dataframe(display_summary, use_container_width=True, hide_index=True)
+            st.dataframe(display_summary, width="stretch", hide_index=True)
 
             if not parquet_files_have_same_schema(comparison_file_summaries):
                 st.warning(
@@ -4584,7 +4818,7 @@ def main(data_paths: Optional[List[str]] = None):
                                     ]
                                     st.dataframe(
                                         duplicate_display,
-                                        use_container_width=True,
+                                        width="stretch",
                                         hide_index=True,
                                     )
 
@@ -4611,7 +4845,7 @@ def main(data_paths: Optional[List[str]] = None):
                                     metric_display = metric_table.drop(columns=["Match ID"])
                                     st.dataframe(
                                         metric_display,
-                                        use_container_width=True,
+                                        width="stretch",
                                         hide_index=True,
                                     )
 
@@ -4627,7 +4861,7 @@ def main(data_paths: Optional[List[str]] = None):
                                         title=f"Largest {selected_metric_label} Differences",
                                     )
                                     fig_metric.update_layout(xaxis_tickangle=-45)
-                                    st.plotly_chart(fig_metric, use_container_width=True)
+                                    st.plotly_chart(fig_metric, width="stretch")
 
                             st.markdown("---")
                             st.subheader("Matched Row Details")
@@ -4686,7 +4920,7 @@ def main(data_paths: Optional[List[str]] = None):
                             with nav_col_left:
                                 st.button(
                                     "⬅️ Previous",
-                                    use_container_width=True,
+                                    width="stretch",
                                     disabled=(
                                         st.session_state[
                                             "comparison_selected_match_index"
@@ -4704,7 +4938,7 @@ def main(data_paths: Optional[List[str]] = None):
                             with nav_col_right:
                                 st.button(
                                     "Next ➡️",
-                                    use_container_width=True,
+                                    width="stretch",
                                     disabled=(
                                         st.session_state[
                                             "comparison_selected_match_index"
@@ -4729,7 +4963,7 @@ def main(data_paths: Optional[List[str]] = None):
                             if not selected_summary.empty:
                                 st.dataframe(
                                     selected_summary,
-                                    use_container_width=True,
+                                    width="stretch",
                                     hide_index=True,
                                 )
 
@@ -4822,7 +5056,7 @@ def main(data_paths: Optional[List[str]] = None):
                             if not geometry_metrics.empty:
                                 st.dataframe(
                                     geometry_metrics,
-                                    use_container_width=True,
+                                    width="stretch",
                                     hide_index=True,
                                 )
 
@@ -4837,7 +5071,7 @@ def main(data_paths: Optional[List[str]] = None):
                                 else:
                                     st.dataframe(
                                         bond_changes,
-                                        use_container_width=True,
+                                        width="stretch",
                                         hide_index=True,
                                     )
                             with col_angles:
@@ -4850,7 +5084,7 @@ def main(data_paths: Optional[List[str]] = None):
                                 else:
                                     st.dataframe(
                                         angle_changes,
-                                        use_container_width=True,
+                                        width="stretch",
                                         hide_index=True,
                                     )
 
@@ -4871,11 +5105,11 @@ def main(data_paths: Optional[List[str]] = None):
                                     "available for the selected comparison."
                                 )
                             else:
-                                st.plotly_chart(spectrum_fig, use_container_width=True)
+                                st.plotly_chart(spectrum_fig, width="stretch")
                                 if not spectrum_summary.empty:
                                     st.dataframe(
                                         spectrum_summary,
-                                        use_container_width=True,
+                                        width="stretch",
                                         hide_index=True,
                                     )
                                 if spectrum_mode == "Vibrational frequencies":
@@ -4900,7 +5134,7 @@ def main(data_paths: Optional[List[str]] = None):
                             else:
                                 st.dataframe(
                                     row_comparison,
-                                    use_container_width=True,
+                                    width="stretch",
                                     hide_index=True,
                                 )
 
@@ -4931,11 +5165,6 @@ def main(data_paths: Optional[List[str]] = None):
             st.info("💡 Try adjusting filters or uploading reaction data files.")
             return
 
-        # Check for required columns
-        if "G_eV" not in df_reac.columns:
-            st.error("Dataset does not contain 'G_eV' (Gibbs energy) column.")
-            return
-
         if "unique_name" not in df_reac.columns:
             st.error("Dataset does not contain 'unique_name' column.")
             return
@@ -4945,11 +5174,15 @@ def main(data_paths: Optional[List[str]] = None):
         try:
             # Calculate reaction delta G values
             with st.spinner("Calculating reaction ΔG values..."):
-                delta_df = calculate_reaction_gibbs(df_reac, energy_unit=energy_unit)
+                delta_df = calculate_reaction_table(df_reac, energy_unit=energy_unit)
 
             if delta_df.empty:
-                st.warning("No complete reactions found (missing reactant, product, or CO2).")
-                st.info("Please ensure dataset contains entries with roles: 'reactant', 'product', and 'co2'.")
+                st.warning("No complete reactions found.")
+                st.info(
+                    "For IQC thermo datasets, ensure entries include reactant, product, "
+                    "and CO2 rows with G_eV. For reaction JSON, ensure paired reactant "
+                    "and product rows include reaction_gibbs_kcal."
+                )
             else:
                 # Create the delta G heatmap
                 st.subheader("ΔG Heatmap: Bipyridine vs Alkyne")
@@ -4981,7 +5214,7 @@ def main(data_paths: Optional[List[str]] = None):
                     xaxis_tickangle=-45,
                 )
 
-                st.plotly_chart(fig_heatmap, use_container_width=True)
+                st.plotly_chart(fig_heatmap, width="stretch")
 
                 st.markdown("---")
 
@@ -5008,33 +5241,93 @@ def main(data_paths: Optional[List[str]] = None):
                 # Detailed Reaction Exploration
                 st.subheader("Explore Individual Reactions")
 
-                # Create columns for alkyne and bipyridine selection
-                col_sel1, col_sel2 = st.columns(2)
+                reaction_rows = delta_df.reset_index(drop=True)
+                reaction_options = build_reaction_selection_options(
+                    reaction_rows,
+                    energy_unit=energy_unit,
+                )
 
-                with col_sel1:
-                    selected_bipy = st.selectbox(
-                        "Select Bipyridine Ligand",
-                        options=sorted(delta_df["bipyridine"].unique()),
-                        key="reaction_bipy_select",
+                if not reaction_options.empty:
+                    reaction_option_ids = reaction_options["_reaction_option_id"].tolist()
+                    reaction_label_map = dict(
+                        zip(
+                            reaction_options["_reaction_option_id"],
+                            reaction_options["_reaction_label"],
+                            strict=True,
+                        )
+                    )
+                    selected_reaction_index = sync_indexed_selection(
+                        st.session_state,
+                        reaction_option_ids,
+                        "reaction_selected_option_id",
+                        "reaction_selected_index",
+                    )
+                    selected_reaction_id = st.selectbox(
+                        "Reaction",
+                        options=reaction_option_ids,
+                        index=selected_reaction_index,
+                        format_func=lambda option_id: reaction_label_map.get(
+                            option_id,
+                            option_id,
+                        ),
+                        key="reaction_selected_option_id",
+                    )
+                    st.session_state["reaction_selected_index"] = (
+                        reaction_option_ids.index(selected_reaction_id)
                     )
 
-                with col_sel2:
-                    selected_alkyne = st.selectbox(
-                        "Select Alkyne",
-                        options=sorted(delta_df[delta_df["bipyridine"] == selected_bipy]["alkyne"].unique()),
-                        key="reaction_alkyne_select",
+                    def _go_reaction_prev():
+                        move_indexed_selection(
+                            st.session_state,
+                            reaction_option_ids,
+                            "reaction_selected_option_id",
+                            -1,
+                            "reaction_selected_index",
+                        )
+
+                    def _go_reaction_next():
+                        move_indexed_selection(
+                            st.session_state,
+                            reaction_option_ids,
+                            "reaction_selected_option_id",
+                            1,
+                            "reaction_selected_index",
+                        )
+
+                    nav_col_left, nav_col_center, nav_col_right = st.columns([1, 2, 1])
+                    with nav_col_left:
+                        st.button(
+                            "⬅️ Previous",
+                            width="stretch",
+                            disabled=st.session_state["reaction_selected_index"] == 0,
+                            on_click=_go_reaction_prev,
+                            key="reaction_prev_button",
+                        )
+                    with nav_col_center:
+                        st.write(
+                            f"{st.session_state['reaction_selected_index'] + 1} "
+                            f"of {len(reaction_option_ids)}"
+                        )
+                    with nav_col_right:
+                        st.button(
+                            "Next ➡️",
+                            width="stretch",
+                            disabled=(
+                                st.session_state["reaction_selected_index"]
+                                == len(reaction_option_ids) - 1
+                            ),
+                            on_click=_go_reaction_next,
+                            key="reaction_next_button",
+                        )
+
+                    rxn = reaction_rows.iloc[st.session_state["reaction_selected_index"]]
+                    is_precomputed_reaction = (
+                        rxn.get("reaction_data_source") == "precomputed_json"
                     )
 
-                # Get the selected reaction
-                selected_reaction = delta_df[
-                    (delta_df["bipyridine"] == selected_bipy)
-                    & (delta_df["alkyne"] == selected_alkyne)
-                ]
-
-                if not selected_reaction.empty:
-                    rxn = selected_reaction.iloc[0]
-
-                    st.subheader(f"Reaction: {selected_bipy} + {selected_alkyne}")
+                    st.subheader(
+                        f"Reaction {st.session_state['reaction_selected_index'] + 1}"
+                    )
 
                     # Display reaction information
                     col_info1, col_info2, col_info3 = st.columns(3)
@@ -5045,11 +5338,39 @@ def main(data_paths: Optional[List[str]] = None):
                         st.write(favorable)
 
                     with col_info2:
-                        st.metric(f"G_reactant ({energy_unit})", f"{rxn['G_reactant']:.4f}")
-                        st.metric(f"G_product ({energy_unit})", f"{rxn['G_product']:.4f}")
+                        if is_precomputed_reaction:
+                            st.metric(
+                                "Reactant Source G",
+                                format_optional_number(rxn.get("G_reactant")),
+                            )
+                            st.metric(
+                                "Product Source G",
+                                format_optional_number(rxn.get("G_product")),
+                            )
+                        else:
+                            st.metric(
+                                f"G_reactant ({energy_unit})",
+                                format_optional_number(rxn.get("G_reactant")),
+                            )
+                            st.metric(
+                                f"G_product ({energy_unit})",
+                                format_optional_number(rxn.get("G_product")),
+                            )
 
                     with col_info3:
-                        st.metric(f"G_CO2 ({energy_unit})", f"{rxn['G_CO2']:.4f}")
+                        if is_precomputed_reaction:
+                            st.metric(
+                                "Precomputed ΔG (kcal/mol)",
+                                format_optional_number(
+                                    rxn.get("reaction_gibbs_kcal"),
+                                ),
+                            )
+                            st.write("CO2 term is not present in reaction JSON.")
+                        else:
+                            st.metric(
+                                f"G_CO2 ({energy_unit})",
+                                format_optional_number(rxn.get("G_CO2")),
+                            )
 
                     st.markdown("---")
 
@@ -5110,32 +5431,66 @@ def main(data_paths: Optional[List[str]] = None):
 
                     # Show detailed summary table
                     st.subheader("Reaction Summary")
+                    summary_properties = [
+                        "Reaction",
+                        "Reactant Name",
+                        "Product Name",
+                    ]
+                    summary_values = [
+                        str(st.session_state["reaction_selected_index"] + 1),
+                        rxn.get("unique_name_reactant", "N/A"),
+                        rxn.get("unique_name_product", "N/A"),
+                    ]
+                    if is_precomputed_reaction:
+                        summary_properties.extend(
+                            [
+                                "Reactant Source G",
+                                "Product Source G",
+                                "Precomputed ΔG (kcal/mol)",
+                            ]
+                        )
+                        summary_values.extend(
+                            [
+                                format_optional_number(rxn.get("G_reactant"), 6),
+                                format_optional_number(rxn.get("G_product"), 6),
+                                format_optional_number(
+                                    rxn.get("reaction_gibbs_kcal"),
+                                    6,
+                                ),
+                            ]
+                        )
+                    else:
+                        summary_properties.extend(
+                            [
+                                f"Reactant G ({energy_unit})",
+                                f"Product G ({energy_unit})",
+                                f"CO2 G ({energy_unit})",
+                            ]
+                        )
+                        summary_values.extend(
+                            [
+                                format_optional_number(rxn.get("G_reactant"), 6),
+                                format_optional_number(rxn.get("G_product"), 6),
+                                format_optional_number(rxn.get("G_CO2"), 6),
+                            ]
+                        )
+                    summary_properties.extend([f"ΔG ({energy_unit})", "Favorability"])
+                    summary_values.extend(
+                        [
+                            format_optional_number(rxn.get("deltaG"), 6),
+                            (
+                                "✅ Favorable (ΔG < 0)"
+                                if rxn["deltaG"] < 0
+                                else "❌ Unfavorable (ΔG > 0)"
+                            ),
+                        ]
+                    )
                     summary_data = {
-                        "Property": [
-                            "Bipyridine Ligand",
-                            "Alkyne Substrate",
-                            "Reactant Name",
-                            "Product Name",
-                            f"Reactant G ({energy_unit})",
-                            f"Product G ({energy_unit})",
-                            f"CO2 G ({energy_unit})",
-                            f"ΔG ({energy_unit})",
-                            "Favorability",
-                        ],
-                        "Value": [
-                            selected_bipy,
-                            selected_alkyne,
-                            rxn.get("unique_name_reactant", "N/A"),
-                            rxn.get("unique_name_product", "N/A"),
-                            f"{rxn['G_reactant']:.6f}",
-                            f"{rxn['G_product']:.6f}",
-                            f"{rxn['G_CO2']:.6f}",
-                            f"{rxn['deltaG']:.6f}",
-                            "✅ Favorable (ΔG < 0)" if rxn["deltaG"] < 0 else "❌ Unfavorable (ΔG > 0)",
-                        ],
+                        "Property": summary_properties,
+                        "Value": summary_values,
                     }
                     summary_df = pd.DataFrame(summary_data)
-                    st.dataframe(summary_df, use_container_width=True, hide_index=True)
+                    st.dataframe(summary_df, width="stretch", hide_index=True)
 
                 st.markdown("---")
 
@@ -5153,11 +5508,14 @@ def main(data_paths: Optional[List[str]] = None):
                 # Add a vertical line at ΔG = 0
                 fig_deltag.add_vline(x=0, line_dash="dash", line_color="red", annotation_text="ΔG=0")
 
-                st.plotly_chart(fig_deltag, use_container_width=True)
+                st.plotly_chart(fig_deltag, width="stretch")
 
         except ValueError as ve:
             st.error(f"Error processing reactions: {ve}")
-            st.info("Please ensure the dataset contains CO2, reactant, and product entries.")
+            st.info(
+                "Please ensure the dataset contains either IQC CO2/reactant/product "
+                "entries with G_eV, or reaction JSON rows with reaction_gibbs_kcal."
+            )
         except Exception as e:
             st.error(f"Unexpected error in reactions analysis: {e}")
             st.info("Please check your data format and try again.")

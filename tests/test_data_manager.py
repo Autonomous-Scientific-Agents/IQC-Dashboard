@@ -19,6 +19,7 @@ from iqc_dashboard.app import (
     build_row_comparison_table,
     build_ligand_selector_df,
     calculate_reaction_gibbs,
+    calculate_reaction_table,
     build_descriptor_dataframe,
     convert_energy_value,
     create_comparison_spectrum_plot,
@@ -583,6 +584,50 @@ C -2.0 1.3 0.0
         assert result["G_product"].iloc[0] == pytest.approx(1.0)
         assert result["G_CO2"].iloc[0] == pytest.approx(-0.5)
         assert result["deltaG"].iloc[0] == pytest.approx(1.5)
+
+    def test_calculate_reaction_table_uses_precomputed_json_delta(self):
+        """Test reaction table uses reaction_gibbs_kcal when G_eV is unavailable."""
+        test_df = pd.DataFrame(
+            {
+                "source_json_row": [0, 0],
+                "reaction_role": ["reactant", "product"],
+                "unique_name": [
+                    "bipy-A_C2H2_reactant_conf",
+                    "bipy-A_C2H2_product_conf",
+                ],
+                "reaction_gibbs_kcal": [-2.5, -2.5],
+                "source_gibbs": [-307.8, -330.1],
+            }
+        )
+
+        result = calculate_reaction_table(test_df, energy_unit=ENERGY_UNIT_KCAL)
+
+        assert len(result) == 1
+        assert result["reaction_data_source"].iloc[0] == "precomputed_json"
+        assert result["deltaG"].iloc[0] == pytest.approx(-2.5)
+        assert result["reaction_gibbs_kcal"].iloc[0] == pytest.approx(-2.5)
+        assert result["G_reactant"].iloc[0] == pytest.approx(-307.8)
+        assert result["G_product"].iloc[0] == pytest.approx(-330.1)
+        assert pd.isna(result["G_CO2"].iloc[0])
+
+    def test_calculate_reaction_table_converts_precomputed_json_delta_to_ev(self):
+        """Test precomputed reaction_gibbs_kcal values convert to eV display units."""
+        test_df = pd.DataFrame(
+            {
+                "source_json_row": [0, 0],
+                "reaction_role": ["reactant", "product"],
+                "unique_name": [
+                    "bipy-A_C2H2_reactant_conf",
+                    "bipy-A_C2H2_product_conf",
+                ],
+                "reaction_gibbs_kcal": [23.0605, 23.0605],
+                "source_gibbs": [-307.8, -330.1],
+            }
+        )
+
+        result = calculate_reaction_table(test_df, energy_unit=ENERGY_UNIT_EV)
+
+        assert result["deltaG"].iloc[0] == pytest.approx(1.0)
 
     def test_energy_unit_conversion_helpers(self):
         """Test scalar energy conversion and metadata labels."""
