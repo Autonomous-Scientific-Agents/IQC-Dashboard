@@ -16,7 +16,7 @@ def _parse_args() -> argparse.Namespace:
         "--data-path",
         action="append",
         default=[],
-        help="Path to a parquet file or directory (can be repeated).",
+        help="Path to a parquet/json file or directory (can be repeated).",
     )
     args, _ = parser.parse_known_args()
     return args

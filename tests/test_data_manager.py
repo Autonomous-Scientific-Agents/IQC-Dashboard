@@ -19,6 +19,7 @@ from iqc_dashboard.app import (
     build_row_comparison_table,
     build_ligand_selector_df,
     calculate_reaction_gibbs,
+    build_descriptor_dataframe,
     convert_energy_value,
     create_comparison_spectrum_plot,
     energy_metadata_label,
@@ -70,6 +71,80 @@ class TestDataManager:
 
         assert len(saved_paths) == 1
         assert Path(saved_paths[0]).exists()
+
+    def test_load_data_paths_converts_generic_json(self, temp_dir):
+        """Test loading a JSON records file through the Parquet-backed query path."""
+        json_path = Path(temp_dir) / "molecules.json"
+        pd.DataFrame(
+            {
+                "unique_name": ["mol_json_001", "mol_json_002"],
+                "formula": ["H2O", "CO2"],
+                "opt_converged": [True, False],
+            }
+        ).to_json(json_path, orient="records")
+
+        dm = DataManager(temp_dir)
+        loaded_paths = dm.load_data_paths([str(json_path)])
+
+        assert len(loaded_paths) == 1
+        assert loaded_paths[0].endswith(".parquet")
+        assert Path(loaded_paths[0]).exists()
+        loaded_df = pd.read_parquet(loaded_paths[0])
+        assert loaded_df["unique_name"].tolist() == [
+            "mol_json_001",
+            "mol_json_002",
+        ]
+
+    def test_load_data_paths_expands_reaction_json(self, temp_dir):
+        """Test reaction-level JSON expands into descriptor-ready molecule rows."""
+        reactant_xyz = """5
+
+Ni 0.0 0.0 0.0
+N -2.0 0.0 0.0
+N 2.0 0.0 0.0
+C 0.0 2.0 0.0
+O 0.0 -2.0 0.0
+"""
+        product_xyz = """6
+
+Ni 0.0 0.0 0.2
+N -2.0 0.0 0.0
+N 2.4 0.0 0.0
+O 0.0 2.0 0.2
+C 0.0 -2.0 0.2
+C -2.0 1.3 0.0
+"""
+        json_path = Path(temp_dir) / "reaction_data.json"
+        pd.DataFrame(
+            {
+                "ligand_pair": ["bipy-aaeaaeaa_f-C2H2-e"],
+                "stereo_type": ["Type_I"],
+                "insertion_type": ["intermediate"],
+                "reaction_gibbs_kcal": [-2.45],
+                "reactant_gibbs": [-307.8],
+                "product_gibbs": [-330.1],
+                "reactant_geometry": [reactant_xyz],
+                "product_geometry": [product_xyz],
+                "reactant_configuration": ["reactant_conf"],
+                "product_configuration": ["product_conf"],
+            }
+        ).to_json(json_path)
+
+        dm = DataManager(temp_dir)
+        loaded_paths = dm.load_data_paths([str(json_path)])
+        loaded_df = pd.read_parquet(loaded_paths[0])
+
+        assert loaded_df["reaction_role"].tolist() == ["reactant", "product"]
+        assert loaded_df["unique_name"].tolist() == [
+            "bipy-aaeaaeaa_f-C2H2-e_reactant_reactant_conf_Type_I_intermediate_0",
+            "bipy-aaeaaeaa_f-C2H2-e_product_product_conf_Type_I_intermediate_0",
+        ]
+        assert loaded_df["opt_xyz"].tolist() == [reactant_xyz, product_xyz]
+        assert loaded_df["number_of_atoms"].tolist() == [5, 6]
+
+        descriptor_df = build_descriptor_dataframe(loaded_df)
+        assert not descriptor_df.empty
+        assert set(descriptor_df["role"]) == {"reactant", "product"}
 
     @patch("iqc_dashboard.app.duckdb")
     def test_get_connection(self, mock_duckdb, temp_dir):

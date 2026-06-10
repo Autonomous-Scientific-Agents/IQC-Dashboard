@@ -23,6 +23,7 @@ EV_TO_KCAL_MOL = 23.0605
 ENERGY_UNIT_KCAL = "kcal/mol"
 ENERGY_UNIT_EV = "eV"
 ENERGY_UNITS = [ENERGY_UNIT_KCAL, ENERGY_UNIT_EV]
+SUPPORTED_DATA_SUFFIXES = (".parquet", ".json")
 COVALENT_RADII_ANGSTROM = {
     "H": 0.31,
     "B": 0.85,
@@ -132,38 +133,103 @@ class DataManager:
         self.parquet_files: List[str] = []
 
     def save_uploaded_files(self, uploaded_files: List) -> List[str]:
-        """Save uploaded Parquet files to temporary directory and return paths."""
+        """Save uploaded data files to temporary directory and return query-ready paths."""
         saved_paths = []
         for uploaded_file in uploaded_files:
             if uploaded_file is not None:
                 file_path = self.temp_dir / uploaded_file.name
                 with open(file_path, "wb") as f:
                     f.write(uploaded_file.getbuffer())
-                saved_paths.append(str(file_path))
+                converted_path = self.prepare_data_file(file_path)
+                if converted_path is not None:
+                    saved_paths.append(str(converted_path))
         self.parquet_files = saved_paths
         return saved_paths
 
-    def load_parquet_paths(self, paths: List[str]) -> List[str]:
-        """Load Parquet files from local filesystem paths."""
+    def load_data_paths(self, paths: List[str]) -> List[str]:
+        """Load Parquet or JSON data from local filesystem paths."""
         resolved_paths: List[str] = []
         for raw_path in paths:
             path = Path(raw_path).expanduser()
             if path.is_dir():
-                dir_files = sorted(path.glob("*.parquet"))
-                if not dir_files:
-                    st.warning(f"No parquet files found in directory: {path}")
-                for file_path in dir_files:
-                    resolved_paths.append(str(file_path))
+                data_files = sorted(
+                    file_path
+                    for file_path in path.iterdir()
+                    if file_path.is_file()
+                    and file_path.suffix.lower() in SUPPORTED_DATA_SUFFIXES
+                )
+                if not data_files:
+                    st.warning(f"No parquet or json files found in directory: {path}")
+                for file_path in data_files:
+                    converted_path = self.prepare_data_file(file_path)
+                    if converted_path is not None:
+                        resolved_paths.append(str(converted_path))
             elif path.is_file():
-                if path.suffix.lower() != ".parquet":
-                    st.warning(f"Skipping non-parquet file: {path}")
-                    continue
-                resolved_paths.append(str(path))
+                converted_path = self.prepare_data_file(path)
+                if converted_path is not None:
+                    resolved_paths.append(str(converted_path))
             else:
                 st.warning(f"Path not found: {path}")
 
         self.parquet_files = resolved_paths
         return resolved_paths
+
+    def load_parquet_paths(self, paths: List[str]) -> List[str]:
+        """Load local data paths. Retained for compatibility with older callers."""
+        return self.load_data_paths(paths)
+
+    def prepare_data_file(self, path: Path) -> Optional[Path]:
+        """Return a Parquet path that DuckDB can query for a supported data file."""
+        suffix = path.suffix.lower()
+        if suffix == ".parquet":
+            return path
+        if suffix == ".json":
+            return self.convert_json_to_parquet(path)
+
+        st.warning(f"Skipping unsupported data file: {path}")
+        return None
+
+    def convert_json_to_parquet(self, json_path: Path) -> Optional[Path]:
+        """Convert a JSON data file into a temporary Parquet file."""
+        try:
+            json_df = self.read_json_dataframe(json_path)
+            parquet_df = normalize_json_dataframe(json_df)
+            if parquet_df.empty:
+                st.warning(f"No rows found in JSON file: {json_path}")
+                return None
+
+            file_stamp = ""
+            try:
+                file_stamp = f":{json_path.stat().st_mtime_ns}"
+            except OSError:
+                pass
+            digest = hashlib.md5(f"{json_path.resolve()}{file_stamp}".encode()).hexdigest()[:10]
+            parquet_path = self.temp_dir / f"{json_path.stem}_{digest}.parquet"
+            parquet_df.to_parquet(parquet_path, index=False)
+            return parquet_path
+        except Exception as e:
+            st.warning(f"Unable to load JSON file {json_path}: {e}")
+            return None
+
+    @staticmethod
+    def read_json_dataframe(json_path: Path) -> pd.DataFrame:
+        """Read common JSON table layouts into a DataFrame."""
+        try:
+            return pd.read_json(json_path)
+        except ValueError:
+            with open(json_path, encoding="utf-8") as json_file:
+                json_data = json.load(json_file)
+
+            if isinstance(json_data, list):
+                return pd.DataFrame(json_data)
+            if isinstance(json_data, dict):
+                for key in ("data", "records", "rows"):
+                    value = json_data.get(key)
+                    if isinstance(value, list):
+                        return pd.DataFrame(value)
+                return pd.DataFrame.from_dict(json_data)
+
+            raise ValueError("Unsupported JSON table structure.")
 
     def _get_parquet_files_hash(self) -> str:
         """Generate a hash of parquet files for caching purposes."""
@@ -688,6 +754,163 @@ class DataManager:
             except Exception as e2:
                 st.warning(f"Error getting schema: {e2}")
             return pd.DataFrame()
+
+
+# ============================================================================
+# Data Normalization Helper Functions
+# ============================================================================
+
+
+def normalize_json_dataframe(json_df: pd.DataFrame) -> pd.DataFrame:
+    """Normalize supported JSON table layouts to dashboard-queryable rows."""
+    if json_df.empty:
+        return json_df
+
+    if is_reaction_json_dataframe(json_df):
+        return expand_reaction_json_dataframe(json_df)
+
+    return json_df.reset_index(drop=True)
+
+
+def is_reaction_json_dataframe(df: pd.DataFrame) -> bool:
+    """Return True for reaction-level JSON containing paired geometries."""
+    required_columns = {
+        "ligand_pair",
+        "reactant_geometry",
+        "product_geometry",
+    }
+    return required_columns.issubset(df.columns)
+
+
+def sanitize_name_part(value: Any) -> str:
+    """Return a compact token suitable for generated unique_name values."""
+    if value is None:
+        return ""
+    try:
+        if pd.isna(value):
+            return ""
+    except (TypeError, ValueError):
+        pass
+
+    text = str(value).strip()
+    if not text:
+        return ""
+    text = re.sub(r"\s+", "-", text)
+    return re.sub(r"[^A-Za-z0-9+_.-]+", "-", text).strip("-")
+
+
+def get_optional_row_value(row: pd.Series, column: str) -> Any:
+    """Return a row value, or None when the column is missing/null."""
+    if column not in row.index:
+        return None
+    value = row[column]
+    try:
+        if pd.isna(value):
+            return None
+    except (TypeError, ValueError):
+        pass
+    return value
+
+
+def count_xyz_atoms(xyz_string: Any) -> Optional[int]:
+    """Return atom count from XYZ text when available."""
+    if xyz_string is None:
+        return None
+    lines = str(xyz_string).splitlines()
+    if not lines:
+        return None
+    try:
+        return int(str(lines[0]).strip())
+    except ValueError:
+        parsed_xyz = parse_xyz_coordinates(str(xyz_string))
+        if parsed_xyz is None:
+            return None
+        elements, _ = parsed_xyz
+        return len(elements)
+
+
+def build_reaction_json_unique_name(row: pd.Series, role: str, row_index: Any) -> str:
+    """Build a parseable unique_name for one JSON reaction component."""
+    ligand_pair = sanitize_name_part(get_optional_row_value(row, "ligand_pair"))
+    if not ligand_pair:
+        ligand_pair = f"reaction-{row_index}"
+
+    config = sanitize_name_part(get_optional_row_value(row, f"{role}_configuration"))
+    stereo = sanitize_name_part(get_optional_row_value(row, "stereo_type"))
+    insertion = sanitize_name_part(get_optional_row_value(row, "insertion_type"))
+    suffix_parts = [part for part in (config, stereo, insertion, str(row_index)) if part]
+    suffix = "_".join(suffix_parts)
+    if suffix:
+        return f"{ligand_pair}_{role}_{suffix}"
+    return f"{ligand_pair}_{role}_{row_index}"
+
+
+def get_reaction_json_smiles(row: pd.Series, role: str) -> Optional[str]:
+    """Return a role-specific SMILES value if present in JSON data."""
+    candidate_columns = (
+        f"{role}_smiles",
+        f"{role}_initial_smiles",
+        f"{role}_opt_smiles",
+        "smiles",
+    )
+    for column in candidate_columns:
+        value = get_optional_row_value(row, column)
+        if value is not None:
+            return str(value)
+    return None
+
+
+def build_reaction_json_component_row(row: pd.Series, role: str, row_index: Any) -> dict:
+    """Build one molecule-like row from a reaction-level JSON row."""
+    geometry = get_optional_row_value(row, f"{role}_geometry")
+    if geometry is None:
+        geometry = ""
+
+    excluded_columns = {
+        "reactant_geometry",
+        "product_geometry",
+        "reactant_gibbs",
+        "product_gibbs",
+    }
+    component_row = {
+        column: value for column, value in row.to_dict().items() if column not in excluded_columns
+    }
+    component_row.update(
+        {
+            "unique_name": build_reaction_json_unique_name(row, role, row_index),
+            "reaction_role": role,
+            "source_json_row": row_index,
+            "initial_xyz": str(geometry),
+            "opt_xyz": str(geometry),
+            "number_of_atoms": count_xyz_atoms(geometry),
+            "source_gibbs": get_optional_row_value(row, f"{role}_gibbs"),
+            "formula": get_optional_row_value(row, "formula"),
+            "initial_smiles": "",
+            "opt_smiles": "",
+            "task": "reaction",
+            "calculator": "json",
+            "opt_converged": True,
+            "smiles_changed": False,
+            "number_of_imaginary": 0,
+        }
+    )
+
+    smiles = get_reaction_json_smiles(row, role)
+    if smiles is not None:
+        component_row["initial_smiles"] = smiles
+        component_row["opt_smiles"] = smiles
+
+    return component_row
+
+
+def expand_reaction_json_dataframe(json_df: pd.DataFrame) -> pd.DataFrame:
+    """Expand reaction-level JSON rows into reactant/product molecule rows."""
+    rows = []
+    for row_index, row in json_df.reset_index(drop=True).iterrows():
+        rows.append(build_reaction_json_component_row(row, "reactant", row_index))
+        rows.append(build_reaction_json_component_row(row, "product", row_index))
+
+    return pd.DataFrame(rows)
 
 
 # ============================================================================
@@ -3182,7 +3405,7 @@ def main(data_paths: Optional[List[str]] = None):
     if data_paths:
         if st.session_state.get("cli_data_paths") != data_paths:
             st.session_state["cli_data_paths"] = list(data_paths)
-            loaded_paths = data_manager.load_parquet_paths(data_paths)
+            loaded_paths = data_manager.load_data_paths(data_paths)
             st.session_state.data_loaded = bool(loaded_paths)
             st.session_state["cli_loaded_paths"] = loaded_paths
         elif "cli_loaded_paths" not in st.session_state:
@@ -3196,10 +3419,10 @@ def main(data_paths: Optional[List[str]] = None):
 
         # File Uploader
         uploaded_files = st.file_uploader(
-            "Upload Parquet Files",
-            type=["parquet"],
+            "Upload Parquet or JSON Files",
+            type=["parquet", "json"],
             accept_multiple_files=True,
-            help="Upload IQC data in Parquet format",
+            help="Upload IQC data in Parquet format or supported JSON table data",
         )
 
         if uploaded_files:
