@@ -20,6 +20,11 @@ import hashlib
 import json
 import base64
 import zlib
+import os
+import platform
+import socket
+import subprocess
+import sys
 
 EV_TO_KCAL_MOL = 23.0605
 ENERGY_UNIT_KCAL = "kcal/mol"
@@ -221,6 +226,179 @@ DESCRIPTOR_UNIT_LABELS = {
     "dimensionless": "unitless",
     "percent": "%",
 }
+
+
+def format_byte_size(value: Optional[int]) -> str:
+    """Format a byte count using binary units."""
+    if value is None or value < 0:
+        return "Unavailable"
+
+    size = float(value)
+    units = ("B", "KiB", "MiB", "GiB", "TiB")
+    for unit in units:
+        if size < 1024 or unit == units[-1]:
+            precision = 0 if unit == "B" else 2
+            return f"{size:.{precision}f} {unit}"
+        size /= 1024
+    return "Unavailable"
+
+
+def run_git_diagnostic_command(*args: str) -> Optional[str]:
+    """Run a read-only Git command for diagnostics."""
+    repository_root = Path(__file__).resolve().parents[1]
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(repository_root), *args],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=2,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+    output = result.stdout.strip()
+    return output or None
+
+
+def collect_git_diagnostic_info() -> Dict[str, str]:
+    """Return Git revision details when repository metadata is available."""
+    repository_commit = run_git_diagnostic_command("rev-parse", "--short=12", "HEAD")
+    commit = repository_commit
+    if commit is None:
+        commit = (
+            os.environ.get("GITHUB_SHA")
+            or os.environ.get("COMMIT_SHA")
+            or os.environ.get("SOURCE_VERSION")
+        )
+
+    branch = run_git_diagnostic_command("branch", "--show-current")
+    if branch is None:
+        branch = os.environ.get("GITHUB_REF_NAME")
+
+    status = run_git_diagnostic_command("status", "--porcelain")
+    if repository_commit is None:
+        working_tree = "Unavailable"
+    else:
+        working_tree = "Dirty" if status else "Clean"
+
+    return {
+        "Commit": commit or "Unavailable",
+        "Branch": branch or "Unavailable",
+        "Commit subject": (
+            run_git_diagnostic_command("show", "-s", "--format=%s", "HEAD")
+            or "Unavailable"
+        ),
+        "Commit date": (
+            run_git_diagnostic_command("show", "-s", "--format=%cI", "HEAD")
+            or "Unavailable"
+        ),
+        "Working tree": working_tree,
+    }
+
+
+def read_linux_cpu_model() -> Optional[str]:
+    """Read a CPU model from Linux procfs when available."""
+    cpuinfo_path = Path("/proc/cpuinfo")
+    if not cpuinfo_path.is_file():
+        return None
+    try:
+        for line in cpuinfo_path.read_text(encoding="utf-8").splitlines():
+            if line.lower().startswith(("model name", "hardware")):
+                return line.split(":", maxsplit=1)[1].strip()
+    except (OSError, IndexError):
+        return None
+    return None
+
+
+def get_cpu_model() -> str:
+    """Return the most specific CPU model available on the host."""
+    processor = platform.processor().strip()
+
+    if platform.system() == "Darwin":
+        try:
+            result = subprocess.run(
+                ["sysctl", "-n", "machdep.cpu.brand_string"],
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=2,
+            )
+            if result.stdout.strip():
+                return result.stdout.strip()
+        except (OSError, subprocess.SubprocessError):
+            pass
+
+        try:
+            result = subprocess.run(
+                ["system_profiler", "SPHardwareDataType"],
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            for line in result.stdout.splitlines():
+                if line.strip().startswith("Chip:"):
+                    return line.split(":", maxsplit=1)[1].strip()
+        except (OSError, subprocess.SubprocessError, IndexError):
+            pass
+
+    linux_model = read_linux_cpu_model()
+    if linux_model:
+        return linux_model
+
+    generic_processors = {"arm", "arm64", "x86_64", "amd64", ""}
+    if processor.lower() not in generic_processors:
+        return processor
+    return platform.machine() or "Unavailable"
+
+
+def collect_host_diagnostic_info() -> Dict[str, str]:
+    """Return host CPU, memory, operating system, and process details."""
+    physical_cores = None
+    logical_cores = os.cpu_count()
+    total_memory = None
+    available_memory = None
+    process_memory = None
+
+    try:
+        import psutil
+
+        physical_cores = psutil.cpu_count(logical=False)
+        logical_cores = psutil.cpu_count(logical=True) or logical_cores
+        memory = psutil.virtual_memory()
+        total_memory = memory.total
+        available_memory = memory.available
+        process_memory = psutil.Process().memory_info().rss
+    except (ImportError, OSError, AttributeError):
+        try:
+            total_memory = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
+        except (AttributeError, OSError, ValueError):
+            pass
+
+    core_description = (
+        f"{physical_cores} physical / {logical_cores} logical"
+        if physical_cores is not None
+        else f"{logical_cores} logical"
+    )
+    return {
+        "Hostname": socket.gethostname(),
+        "Operating system": platform.platform(),
+        "Architecture": platform.machine() or "Unavailable",
+        "CPU": get_cpu_model(),
+        "CPU cores": core_description,
+        "Total memory": format_byte_size(total_memory),
+        "Available memory": format_byte_size(available_memory),
+        "Dashboard process memory": format_byte_size(process_memory),
+        "Python executable": sys.executable,
+        "Python version": platform.python_version(),
+    }
+
+
+def format_diagnostic_section(values: Dict[str, str]) -> str:
+    """Format diagnostic key/value pairs for a compact code block."""
+    return "\n".join(f"{key}: {value}" for key, value in values.items())
+
 
 # Import 3D visualization libraries - will be checked when needed
 STMOL_AVAILABLE = False
@@ -4012,6 +4190,31 @@ def build_descriptor_hover_html(
       margin-bottom: 10px;
       overflow-wrap: anywhere;
     }}
+    .preview-controls {{
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      margin-bottom: 10px;
+      font-size: 12px;
+      color: #4f5b66;
+    }}
+    .pin-status[data-pinned="true"] {{
+      color: #0b6b3a;
+      font-weight: 650;
+    }}
+    .unpin-button {{
+      border: 1px solid #c7d0db;
+      border-radius: 5px;
+      padding: 4px 8px;
+      background: #ffffff;
+      color: #243447;
+      cursor: pointer;
+    }}
+    .unpin-button:disabled {{
+      cursor: default;
+      opacity: 0.45;
+    }}
     #descriptor-viewer {{
       height: 390px;
       width: 100%;
@@ -4036,15 +4239,25 @@ def build_descriptor_hover_html(
   <div class="descriptor-shell">
     <div id="descriptor-plot"></div>
     <div class="preview-panel">
-      <div class="preview-title" id="preview-name">Hover a point</div>
+      <div class="preview-title" id="preview-name">Hover or click a point</div>
       <div class="preview-meta">
         <div><strong>SMILES:</strong> <span id="preview-smiles"></span></div>
         <div><strong>Value:</strong> <span id="preview-value"></span></div>
         <div><strong>Reaction:</strong> <span id="preview-reaction"></span></div>
         <div><strong>Details:</strong> <span id="preview-atoms"></span></div>
       </div>
+      <div class="preview-controls">
+        <span class="pin-status" id="pin-status" data-pinned="false">
+          Hover preview. Click a point to pin it.
+        </span>
+        <button class="unpin-button" id="unpin-button" type="button" disabled>
+          Unpin
+        </button>
+      </div>
       <div id="descriptor-viewer">
-        <div class="viewer-message">Hover a plotted molecule to load its geometry.</div>
+        <div class="viewer-message">
+          Hover a plotted molecule to preview it, or click to pin it.
+        </div>
       </div>
     </div>
   </div>
@@ -4052,7 +4265,10 @@ def build_descriptor_hover_html(
     const points = {points_json};
     const plotEl = document.getElementById("descriptor-plot");
     const viewerEl = document.getElementById("descriptor-viewer");
+    const pinStatusEl = document.getElementById("pin-status");
+    const unpinButtonEl = document.getElementById("unpin-button");
     let viewer = null;
+    let pinnedPointIndex = null;
 
     function groupByVariant(items) {{
       const groups = new Map();
@@ -4064,6 +4280,15 @@ def build_descriptor_hover_html(
         groups.get(key).push(point);
       }}
       return groups;
+    }}
+
+    function updatePinControls() {{
+      const isPinned = pinnedPointIndex !== null;
+      pinStatusEl.dataset.pinned = String(isPinned);
+      pinStatusEl.textContent = isPinned
+        ? "Pinned. Drag the molecule to rotate it."
+        : "Hover preview. Click a point to pin it.";
+      unpinButtonEl.disabled = !isPinned;
     }}
 
     function renderPoint(point) {{
@@ -4143,16 +4368,36 @@ def build_descriptor_hover_html(
     );
 
     plotEl.on("plotly_hover", (eventData) => {{
-      if (!eventData.points || !eventData.points.length) {{
+      if (
+        pinnedPointIndex !== null
+        || !eventData.points
+        || !eventData.points.length
+      ) {{
         return;
       }}
       const pointIndex = eventData.points[0].customdata[0];
       renderPoint(points[pointIndex]);
     }});
 
+    plotEl.on("plotly_click", (eventData) => {{
+      if (!eventData.points || !eventData.points.length) {{
+        return;
+      }}
+      const pointIndex = eventData.points[0].customdata[0];
+      pinnedPointIndex = pinnedPointIndex === pointIndex ? null : pointIndex;
+      renderPoint(points[pointIndex]);
+      updatePinControls();
+    }});
+
+    unpinButtonEl.addEventListener("click", () => {{
+      pinnedPointIndex = null;
+      updatePinControls();
+    }});
+
     if (points.length > 0) {{
       renderPoint(points[0]);
     }}
+    updatePinControls();
   </script>
 </body>
 </html>
@@ -4298,6 +4543,31 @@ def build_descriptor_delta_hover_html(
       margin-bottom: 10px;
       overflow-wrap: anywhere;
     }}
+    .preview-controls {{
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      margin-bottom: 10px;
+      font-size: 12px;
+      color: #4f5b66;
+    }}
+    .pin-status[data-pinned="true"] {{
+      color: #0b6b3a;
+      font-weight: 650;
+    }}
+    .unpin-button {{
+      border: 1px solid #c7d0db;
+      border-radius: 5px;
+      padding: 4px 8px;
+      background: #ffffff;
+      color: #243447;
+      cursor: pointer;
+    }}
+    .unpin-button:disabled {{
+      cursor: default;
+      opacity: 0.45;
+    }}
     #descriptor-viewer {{
       height: 390px;
       width: 100%;
@@ -4322,7 +4592,7 @@ def build_descriptor_delta_hover_html(
   <div class="descriptor-shell">
     <div id="descriptor-plot"></div>
     <div class="preview-panel">
-      <div class="preview-title" id="preview-name">Hover a point</div>
+      <div class="preview-title" id="preview-name">Hover or click a point</div>
       <div class="preview-meta">
         <div><strong>Species:</strong> <span id="preview-role"></span></div>
         <div><strong>SMILES:</strong> <span id="preview-smiles"></span></div>
@@ -4331,8 +4601,18 @@ def build_descriptor_delta_hover_html(
         <div><strong>Reaction:</strong> <span id="preview-reaction"></span></div>
         <div><strong>Details:</strong> <span id="preview-atoms"></span></div>
       </div>
+      <div class="preview-controls">
+        <span class="pin-status" id="pin-status" data-pinned="false">
+          Hover preview. Click a point to pin it.
+        </span>
+        <button class="unpin-button" id="unpin-button" type="button" disabled>
+          Unpin
+        </button>
+      </div>
       <div id="descriptor-viewer">
-        <div class="viewer-message">Hover a plotted molecule to load its geometry.</div>
+        <div class="viewer-message">
+          Hover a plotted molecule to preview it, or click to pin it.
+        </div>
       </div>
     </div>
   </div>
@@ -4345,7 +4625,10 @@ def build_descriptor_delta_hover_html(
     const xAxisTitle = {x_axis_title_json};
     const plotEl = document.getElementById("descriptor-plot");
     const viewerEl = document.getElementById("descriptor-viewer");
+    const pinStatusEl = document.getElementById("pin-status");
+    const unpinButtonEl = document.getElementById("unpin-button");
     let viewer = null;
+    let pinnedPointIndex = null;
 
     function groupByVariant(items) {{
       const groups = new Map();
@@ -4364,6 +4647,15 @@ def build_descriptor_delta_hover_html(
         return "N/A";
       }}
       return value.toFixed(digits);
+    }}
+
+    function updatePinControls() {{
+      const isPinned = pinnedPointIndex !== null;
+      pinStatusEl.dataset.pinned = String(isPinned);
+      pinStatusEl.textContent = isPinned
+        ? "Pinned. Drag the molecule to rotate it."
+        : "Hover preview. Click a point to pin it.";
+      unpinButtonEl.disabled = !isPinned;
     }}
 
     function renderPoint(point) {{
@@ -4448,16 +4740,36 @@ def build_descriptor_delta_hover_html(
     );
 
     plotEl.on("plotly_hover", (eventData) => {{
-      if (!eventData.points || !eventData.points.length) {{
+      if (
+        pinnedPointIndex !== null
+        || !eventData.points
+        || !eventData.points.length
+      ) {{
         return;
       }}
       const pointIndex = eventData.points[0].customdata[0];
       renderPoint(points[pointIndex]);
     }});
 
+    plotEl.on("plotly_click", (eventData) => {{
+      if (!eventData.points || !eventData.points.length) {{
+        return;
+      }}
+      const pointIndex = eventData.points[0].customdata[0];
+      pinnedPointIndex = pinnedPointIndex === pointIndex ? null : pointIndex;
+      renderPoint(points[pointIndex]);
+      updatePinControls();
+    }});
+
+    unpinButtonEl.addEventListener("click", () => {{
+      pinnedPointIndex = null;
+      updatePinControls();
+    }});
+
     if (points.length > 0) {{
       renderPoint(points[0]);
     }}
+    updatePinControls();
   </script>
 </body>
 </html>
@@ -5199,11 +5511,14 @@ def main(data_paths: Optional[List[str]] = None):
 
     # Diagnostic information (can be hidden with expander)
     with st.expander("🔧 Diagnostic Information", expanded=False):
-        import sys
+        st.write("**Application Revision:**")
+        st.code(format_diagnostic_section(collect_git_diagnostic_info()))
 
-        st.code(f"Python executable: {sys.executable}")
-        st.code(f"Python version: {sys.version}")
-        st.code(f"Python path: {sys.path[:3]}...")  # Show first 3 entries
+        st.write("**Host Resources:**")
+        st.code(format_diagnostic_section(collect_host_diagnostic_info()))
+
+        st.write("**Python Path:**")
+        st.code("\n".join(sys.path[:3]))
 
         # Check imports
         st.write("**Library Import Status:**")

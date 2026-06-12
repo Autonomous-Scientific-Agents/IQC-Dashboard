@@ -352,6 +352,43 @@ def test_descriptor_delta_hover_html_uses_descriptor_x_and_delta_g_y():
     assert "y: group.map((point) => point.deltaG)" in html
 
 
+def test_descriptor_delta_hover_html_can_pin_clicked_structure():
+    """Clicking a plot point pins its structure until explicitly unpinned."""
+    records = pd.DataFrame(
+        [
+            {
+                "descriptor_id": "prod_ni_o1",
+                "descriptor": "Product: Ni O1",
+                "role": "product",
+                "variant": "Type_I",
+                "value": 1.2345,
+                "deltaG": -5.25,
+                "unique_name": "product_a",
+                "smiles": "C",
+                "xyz": read_example_xyz("type_I_product.xyz"),
+                "atom_summary": "descriptor_kit",
+                "reaction_id": "10",
+                "reactant_name": "reactant_a",
+                "product_name": "product_a",
+            }
+        ]
+    )
+
+    html = build_descriptor_delta_hover_html(
+        records,
+        "Product: Ni O1",
+        "Å",
+        "kcal/mol",
+        "ΔG",
+    )
+
+    assert 'plotEl.on("plotly_click"' in html
+    assert "pinnedPointIndex !== null" in html
+    assert "pinnedPointIndex === pointIndex ? null : pointIndex" in html
+    assert 'id="unpin-button"' in html
+    assert "Drag the molecule to rotate it." in html
+
+
 def test_descriptor_delta_hover_html_reindexes_after_skipping_nonfinite_rows():
     """Skipped rows must not leave stale indexes in Plotly hover callbacks."""
     records = pd.DataFrame(
