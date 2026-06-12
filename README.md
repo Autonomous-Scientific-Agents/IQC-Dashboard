@@ -221,6 +221,23 @@ or Parquet paths can also be loaded when launching through `streamlit_app.py`:
 streamlit run streamlit_app.py -- --data-path /Users/keceli/Downloads/reaction_data.json
 ```
 
+For large reaction JSON datasets, precompute all descriptor-tab values once and
+load the generated Parquet file. The output keeps every input JSON field, adds
+dashboard-compatible reactant/product rows, and stores all `reac_*`, `prod_*`,
+and `tdelta_*` descriptor columns:
+
+```bash
+python scripts/precompute_descriptor_parquet.py \
+  /path/to/reaction_data.json \
+  --output /path/to/reaction_data_descriptors.parquet
+
+streamlit run streamlit_app.py -- \
+  --data-path /path/to/reaction_data_descriptors.parquet
+```
+
+The script uses all but one CPU core by default. Use `--workers 1` for serial
+execution or `--overwrite` to replace an existing output file.
+
 ### Running with Docker
 
 The CI publishes images to GitHub Container Registry on branch and tag pushes.

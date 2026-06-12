@@ -3278,6 +3278,382 @@ def compute_selected_single_descriptor_value(
     return float(value), ""
 
 
+def get_precomputed_descriptor_value(
+    pair_entry: dict,
+    descriptor_id: str,
+    role: str,
+) -> Tuple[bool, Optional[float]]:
+    """Return a precomputed descriptor value and whether its column is present."""
+    row_key = "reactant_row" if role == "reactant" else "product_row"
+    row = pair_entry.get(row_key)
+    if row is None or descriptor_id not in row.index:
+        return False, None
+
+    value = row.get(descriptor_id, None)
+    if not is_finite_descriptor_value(value):
+        return True, None
+    return True, float(value)
+
+
+def is_precomputed_descriptor_dataset(df: pd.DataFrame, descriptor_id: str) -> bool:
+    """Return True when a dataframe has the dashboard precompute schema."""
+    required_columns = {
+        "descriptor_precomputed",
+        "reaction_role",
+        "source_json_row",
+        "reaction_gibbs_kcal",
+        descriptor_id,
+    }
+    if df.empty or not required_columns.issubset(df.columns):
+        return False
+    return bool(df["descriptor_precomputed"].fillna(False).astype(bool).any())
+
+
+def descriptor_keyword_mask(df: pd.DataFrame, keywords: List[str]) -> pd.Series:
+    """Return a vectorized equivalent of row_matches_descriptor_keywords."""
+    if not keywords:
+        return pd.Series(True, index=df.index, dtype=bool)
+
+    searchable_text = pd.Series("", index=df.index, dtype="string")
+    for column in ("unique_name", "initial_smiles", "opt_smiles", "formula"):
+        if column in df.columns:
+            searchable_text = (
+                searchable_text
+                + " "
+                + df[column].astype("string").fillna("").str.lower()
+            )
+
+    mask = pd.Series(True, index=df.index, dtype=bool)
+    for keyword in keywords:
+        mask &= searchable_text.str.contains(
+            str(keyword).lower(),
+            regex=False,
+            na=False,
+        )
+    return mask
+
+
+def preferred_descriptor_series(
+    df: pd.DataFrame,
+    primary_column: str,
+    fallback_column: str,
+) -> pd.Series:
+    """Return primary strings with missing values filled from a fallback column."""
+    fallback = (
+        df[fallback_column].astype("string").fillna("")
+        if fallback_column in df.columns
+        else pd.Series("", index=df.index, dtype="string")
+    )
+    if primary_column not in df.columns:
+        return fallback
+
+    primary = df[primary_column].astype("string")
+    missing = primary.isna() | primary.fillna("").str.strip().eq("")
+    return primary.where(~missing, fallback).fillna("")
+
+
+def get_precomputed_component_rows(
+    df: pd.DataFrame,
+    reactant_keywords: List[str],
+    product_keywords: List[str],
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """Return one eligible reactant and product row per source reaction."""
+    work = df.reset_index(drop=True).copy()
+    role = work["reaction_role"].astype("string").str.lower()
+    reactants = work[role == "reactant"].drop_duplicates(
+        "source_json_row",
+        keep="first",
+    )
+    products = work[role == "product"].drop_duplicates(
+        "source_json_row",
+        keep="first",
+    )
+
+    reactant_ids = set(
+        reactants.loc[
+            descriptor_keyword_mask(reactants, reactant_keywords),
+            "source_json_row",
+        ]
+    )
+    product_ids = set(
+        products.loc[
+            descriptor_keyword_mask(products, product_keywords),
+            "source_json_row",
+        ]
+    )
+    eligible_ids = reactant_ids.intersection(product_ids)
+    return (
+        reactants[reactants["source_json_row"].isin(eligible_ids)].copy(),
+        products[products["source_json_row"].isin(eligible_ids)].copy(),
+    )
+
+
+def descriptor_name_metadata(
+    reactants: pd.DataFrame,
+) -> Tuple[Dict[Any, str], Dict[Any, str]]:
+    """Return bipyridine and alkyne lookup maps keyed by source JSON row."""
+    parsed_names = reactants["unique_name"].astype(str).apply(parse_unique_name)
+    source_ids = reactants["source_json_row"]
+    bipyridines = dict(
+        zip(
+            source_ids,
+            parsed_names.apply(lambda parsed: parsed.get("bipyridine")),
+        )
+    )
+    alkynes = dict(
+        zip(
+            source_ids,
+            parsed_names.apply(lambda parsed: parsed.get("alkyne")),
+        )
+    )
+    return bipyridines, alkynes
+
+
+def build_precomputed_single_descriptor_dataframe(
+    df: pd.DataFrame,
+    descriptor: dict,
+    energy_unit: str,
+    reactant_keywords: List[str],
+    product_keywords: List[str],
+) -> pd.DataFrame:
+    """Build one single-species descriptor plot table without geometry calculations."""
+    columns = descriptor_delta_record_columns()
+    reactants, products = get_precomputed_component_rows(
+        df,
+        reactant_keywords,
+        product_keywords,
+    )
+    if reactants.empty or products.empty:
+        return pd.DataFrame(columns=columns)
+
+    role = descriptor["role"]
+    selected_rows = reactants if role == "reactant" else products
+    selected_rows = selected_rows.copy()
+    descriptor_values = pd.to_numeric(
+        selected_rows[descriptor["id"]],
+        errors="coerce",
+    )
+    delta_g = pd.to_numeric(
+        selected_rows["reaction_gibbs_kcal"],
+        errors="coerce",
+    )
+    if energy_unit == ENERGY_UNIT_EV:
+        delta_g = delta_g / EV_TO_KCAL_MOL
+
+    finite_mask = np.isfinite(descriptor_values) & np.isfinite(delta_g)
+    selected_rows = selected_rows.loc[finite_mask].copy()
+    descriptor_values = descriptor_values.loc[finite_mask].astype(float)
+    delta_g = delta_g.loc[finite_mask].astype(float)
+    if selected_rows.empty:
+        return pd.DataFrame(columns=columns)
+
+    reactant_names = dict(
+        zip(reactants["source_json_row"], reactants["unique_name"].astype(str))
+    )
+    product_names = dict(
+        zip(products["source_json_row"], products["unique_name"].astype(str))
+    )
+    bipyridines, alkynes = descriptor_name_metadata(reactants)
+    source_ids = selected_rows["source_json_row"]
+    variants = selected_rows.get(
+        "insertion_type",
+        pd.Series("", index=selected_rows.index),
+    ).astype("string")
+    variants = variants.where(
+        variants.fillna("").str.strip().ne(""),
+        descriptor_family_label(role),
+    )
+
+    result = pd.DataFrame(
+        {
+            "descriptor_id": descriptor["id"],
+            "descriptor": descriptor["label"],
+            "role": role,
+            "family": descriptor["family"],
+            "variant": variants.astype(str),
+            "value": descriptor_values,
+            "unit": descriptor["unit"],
+            "unique_name": selected_rows["unique_name"].astype(str),
+            "smiles": preferred_descriptor_series(
+                selected_rows,
+                "opt_smiles",
+                "initial_smiles",
+            ).astype(str),
+            "xyz": preferred_descriptor_series(
+                selected_rows,
+                "opt_xyz",
+                "initial_xyz",
+            ).astype(str),
+            "bipyridine": source_ids.map(bipyridines),
+            "alkyne": source_ids.map(alkynes),
+            "atom_summary": (
+                f"precomputed descriptor_kit; {descriptor_family_label(role)} geometry"
+            ),
+            "reaction_id": source_ids.astype(str),
+            "reactant_name": source_ids.map(reactant_names).fillna(""),
+            "product_name": source_ids.map(product_names).fillna(""),
+            "source_json_row": source_ids,
+            "ligand_pair": selected_rows.get(
+                "ligand_pair",
+                pd.Series("", index=selected_rows.index),
+            ),
+            "stereo_type": selected_rows.get(
+                "stereo_type",
+                pd.Series("", index=selected_rows.index),
+            ),
+            "insertion_type": selected_rows.get(
+                "insertion_type",
+                pd.Series("", index=selected_rows.index),
+            ),
+            "deltaG": delta_g,
+            "deltaG_unit": energy_unit,
+        },
+        index=selected_rows.index,
+    )
+    return result.reset_index(drop=True).reindex(columns=columns)
+
+
+def build_precomputed_tdelta_descriptor_dataframe(
+    df: pd.DataFrame,
+    descriptor: dict,
+    energy_unit: str,
+    reactant_keywords: List[str],
+    product_keywords: List[str],
+) -> pd.DataFrame:
+    """Build a pair-descriptor plot table from stored Type-I descriptor deltas."""
+    columns = descriptor_delta_record_columns()
+    reactants, products = get_precomputed_component_rows(
+        df,
+        reactant_keywords,
+        product_keywords,
+    )
+    if reactants.empty or products.empty:
+        return pd.DataFrame(columns=columns)
+
+    reactant_names = dict(
+        zip(reactants["source_json_row"], reactants["unique_name"].astype(str))
+    )
+    bipyridines, alkynes = descriptor_name_metadata(reactants)
+    work = products.copy()
+    work["_insertion_type_normalized"] = work["insertion_type"].apply(
+        normalize_insertion_type
+    )
+    work["_group_ligand_pair"] = work.get(
+        "ligand_pair",
+        pd.Series("", index=work.index),
+    ).astype("string").fillna("")
+    work["_group_stereo_type"] = work.get(
+        "stereo_type",
+        pd.Series("", index=work.index),
+    ).astype("string").fillna("")
+    work["_reactant_name"] = work["source_json_row"].map(reactant_names).fillna("")
+    work["_bipyridine"] = work["source_json_row"].map(bipyridines)
+    work["_alkyne"] = work["source_json_row"].map(alkynes)
+    work["_preferred_smiles"] = preferred_descriptor_series(
+        work,
+        "opt_smiles",
+        "initial_smiles",
+    )
+    work["_preferred_xyz"] = preferred_descriptor_series(
+        work,
+        "opt_xyz",
+        "initial_xyz",
+    )
+
+    group_columns = ["_group_ligand_pair", "_group_stereo_type"]
+    type_i = (
+        work[work["_insertion_type_normalized"] == "type_i"]
+        .drop_duplicates(group_columns, keep="last")
+    )
+    type_ii = (
+        work[work["_insertion_type_normalized"] == "type_ii"]
+        .drop_duplicates(group_columns, keep="last")
+    )
+    paired = type_i.merge(
+        type_ii,
+        on=group_columns,
+        how="inner",
+        suffixes=("_i", "_ii"),
+        sort=False,
+    )
+    if paired.empty:
+        return pd.DataFrame(columns=columns)
+
+    descriptor_values = pd.to_numeric(
+        paired[f"{descriptor['id']}_i"],
+        errors="coerce",
+    )
+    type_i_delta_g = pd.to_numeric(
+        paired["reaction_gibbs_kcal_i"],
+        errors="coerce",
+    )
+    type_ii_delta_g = pd.to_numeric(
+        paired["reaction_gibbs_kcal_ii"],
+        errors="coerce",
+    )
+    delta_g = type_i_delta_g - type_ii_delta_g
+    if energy_unit == ENERGY_UNIT_EV:
+        delta_g = delta_g / EV_TO_KCAL_MOL
+
+    finite_mask = np.isfinite(descriptor_values) & np.isfinite(delta_g)
+    paired = paired.loc[finite_mask].copy()
+    descriptor_values = descriptor_values.loc[finite_mask].astype(float)
+    delta_g = delta_g.loc[finite_mask].astype(float)
+    if paired.empty:
+        return pd.DataFrame(columns=columns)
+
+    product_name_i = paired["unique_name_i"].astype(str)
+    product_name_ii = paired["unique_name_ii"].astype(str)
+    reaction_id_i = paired["source_json_row_i"].astype(str)
+    reaction_id_ii = paired["source_json_row_ii"].astype(str)
+    atom_summary = (
+        "Precomputed regioisomer descriptor delta; Type_I product geometry shown; "
+        "Type_II product="
+        + product_name_ii
+    )
+    result = pd.DataFrame(
+        {
+            "descriptor_id": descriptor["id"],
+            "descriptor": descriptor["label"],
+            "role": "pair",
+            "family": descriptor["family"],
+            "variant": "Type_I - Type_II",
+            "value": descriptor_values,
+            "unit": descriptor["unit"],
+            "unique_name": product_name_i + " | " + product_name_ii,
+            "smiles": paired["_preferred_smiles_i"].astype(str),
+            "xyz": paired["_preferred_xyz_i"].astype(str),
+            "bipyridine": paired["_bipyridine_i"],
+            "alkyne": paired["_alkyne_i"],
+            "atom_summary": atom_summary,
+            "reaction_id": reaction_id_i + " - " + reaction_id_ii,
+            "reactant_name": (
+                paired["_reactant_name_i"].astype(str)
+                + " | "
+                + paired["_reactant_name_ii"].astype(str)
+            ),
+            "product_name": product_name_i + " | " + product_name_ii,
+            "source_json_row": paired["source_json_row_i"],
+            "ligand_pair": paired.get(
+                "ligand_pair_i",
+                paired["_group_ligand_pair"],
+            ),
+            "stereo_type": paired.get(
+                "stereo_type_i",
+                paired["_group_stereo_type"],
+            ),
+            "insertion_type": paired.get(
+                "insertion_type_i",
+                pd.Series("", index=paired.index),
+            ),
+            "deltaG": delta_g,
+            "deltaG_unit": energy_unit,
+        },
+        index=paired.index,
+    )
+    return result.reset_index(drop=True).reindex(columns=columns)
+
+
 def tdelta_source_product_descriptor(descriptor_id: str) -> str:
     """Return the product descriptor used by a tdelta descriptor."""
     return f"prod_{descriptor_id.removeprefix('tdelta_')}"
@@ -3306,15 +3682,22 @@ def build_selected_single_descriptor_records(
         if not is_finite_descriptor_value(delta_g):
             continue
 
-        value, _error = compute_selected_single_descriptor_value(
+        is_precomputed, value = get_precomputed_descriptor_value(
+            pair_entry,
             descriptor_id,
             role,
-            pair_entry[xyz_key],
         )
+        if not is_precomputed:
+            value, _error = compute_selected_single_descriptor_value(
+                descriptor_id,
+                role,
+                pair_entry[xyz_key],
+            )
         if value is None:
             continue
 
-        atom_summary = f"descriptor_kit; {descriptor_family_label(role)} geometry"
+        value_source = "precomputed descriptor_kit" if is_precomputed else "descriptor_kit"
+        atom_summary = f"{value_source}; {descriptor_family_label(role)} geometry"
         record = build_descriptor_kit_record(
             descriptor_id,
             value,
@@ -3361,18 +3744,27 @@ def build_selected_tdelta_descriptor_records(
         if not is_finite_descriptor_value(delta_g):
             continue
 
-        value, _error = compute_selected_single_descriptor_value(
-            source_descriptor_id,
+        is_precomputed, precomputed_value = get_precomputed_descriptor_value(
+            pair_entry,
+            descriptor_id,
             "product",
-            pair_entry["product_xyz"],
         )
-        if value is None:
-            continue
+        source_value = None
+        if not is_precomputed:
+            source_value, _error = compute_selected_single_descriptor_value(
+                source_descriptor_id,
+                "product",
+                pair_entry["product_xyz"],
+            )
+            if source_value is None:
+                continue
 
         group_key = descriptor_tdelta_group_key(pair_entry)
         grouped_pairs.setdefault(group_key, {})[insertion_type] = {
             "pair_entry": pair_entry,
-            "source_value": value,
+            "source_value": source_value,
+            "is_precomputed": is_precomputed,
+            "precomputed_value": precomputed_value,
             "deltaG": float(delta_g),
         }
 
@@ -3382,6 +3774,13 @@ def build_selected_tdelta_descriptor_records(
         type_ii = pair_group.get("type_ii")
         if type_i is None or type_ii is None:
             continue
+
+        if type_i["is_precomputed"]:
+            descriptor_value = type_i["precomputed_value"]
+            if descriptor_value is None:
+                continue
+        else:
+            descriptor_value = type_i["source_value"] - type_ii["source_value"]
 
         pair_entry = type_i["pair_entry"].copy()
         pair_entry["reaction_id"] = (
@@ -3397,14 +3796,19 @@ def build_selected_tdelta_descriptor_records(
             f"{type_ii['pair_entry'].get('product_name', '')}"
         )
         product_row = type_i["pair_entry"]["product_row"]
+        value_source = (
+            "Precomputed regioisomer descriptor delta"
+            if type_i["is_precomputed"]
+            else "Regioisomer descriptor delta"
+        )
         atom_summary = (
-            "Regioisomer descriptor delta; Type_I product geometry shown; "
+            f"{value_source}; Type_I product geometry shown; "
             f"Type_II product={type_ii['pair_entry'].get('product_name', '')}"
         )
 
         record = build_descriptor_kit_record(
             descriptor_id,
-            type_i["source_value"] - type_ii["source_value"],
+            descriptor_value,
             pair_entry,
             product_row,
             type_i["pair_entry"]["product_xyz"],
@@ -3442,6 +3846,27 @@ def build_selected_descriptor_dataframe(
         or get_descriptor_definition(descriptor_id) is None
     ):
         return pd.DataFrame(columns=columns)
+
+    descriptor = get_descriptor_definition(descriptor_id)
+    if descriptor is not None and is_precomputed_descriptor_dataset(df, descriptor_id):
+        reactant_keywords = reactant_keywords or []
+        product_keywords = product_keywords or []
+        if descriptor["role"] in {"reactant", "product"}:
+            return build_precomputed_single_descriptor_dataframe(
+                df,
+                descriptor,
+                energy_unit,
+                reactant_keywords,
+                product_keywords,
+            )
+        if descriptor["role"] == "pair":
+            return build_precomputed_tdelta_descriptor_dataframe(
+                df,
+                descriptor,
+                energy_unit,
+                reactant_keywords,
+                product_keywords,
+            )
 
     pair_entries = build_descriptor_reaction_pairs(
         df,
@@ -5769,7 +6194,12 @@ def main(data_paths: Optional[List[str]] = None):
                 if descriptor is None:
                     st.info("No values for the selected descriptor.")
                 else:
-                    with st.spinner(f"Calculating {descriptor['label']}..."):
+                    descriptor_action = (
+                        "Loading precomputed"
+                        if selected_descriptor_id in descriptor_source_df.columns
+                        else "Calculating"
+                    )
+                    with st.spinner(f"{descriptor_action} {descriptor['label']}..."):
                         descriptor_records = build_selected_descriptor_dataframe(
                             descriptor_source_df,
                             selected_descriptor_id,
