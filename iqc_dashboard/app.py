@@ -164,6 +164,8 @@ def descriptor_label_from_key(descriptor_key: str) -> str:
 def descriptor_unit_for_key(descriptor_key: str) -> str:
     """Infer a display unit from a descriptor_kit key."""
     lower_key = descriptor_key.lower()
+    if "carboxylate_tilt" in lower_key:
+        return "angstrom"
     if "sigma" in lower_key or "tau4" in lower_key:
         return "dimensionless"
     if "vbur" in lower_key:
@@ -2987,6 +2989,7 @@ def build_single_reaction_descriptor_records(pair_entry: dict) -> Tuple[List[dic
         descriptor_values = kit_compute_descriptors(
             pair_entry["reactant_xyz"],
             pair_entry["product_xyz"],
+            stereo_type=pair_entry.get("stereo_type", ""),
             diagnostics=diagnostics,
         )
     except Exception:
@@ -3252,6 +3255,7 @@ def compute_selected_single_descriptor_value(
     descriptor_id: str,
     role: str,
     xyz_string: str,
+    stereo_type: str = "",
 ) -> Tuple[Optional[float], str]:
     """Compute one descriptor_kit value for one species geometry."""
     if kit_geometry is None or kit_topology is None:
@@ -3264,7 +3268,10 @@ def compute_selected_single_descriptor_value(
     try:
         geometry = kit_geometry.build_geom(*kit_geometry.parse_xyz(xyz_string))
         if role == "reactant":
-            species = kit_topology.identify_reactant(geometry)
+            species = kit_topology.identify_reactant(
+                geometry,
+                stereo_type=stereo_type,
+            )
         else:
             species = kit_topology.identify_product(geometry)
         descriptor_values = descriptor_function(species)
@@ -3692,6 +3699,7 @@ def build_selected_single_descriptor_records(
                 descriptor_id,
                 role,
                 pair_entry[xyz_key],
+                stereo_type=pair_entry.get("stereo_type", ""),
             )
         if value is None:
             continue

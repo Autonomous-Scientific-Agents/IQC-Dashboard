@@ -9,7 +9,7 @@ import pytest
 # Add parent directory to path to import the module
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from descriptor_kit import compute_descriptors, compute_tdelta
+from descriptor_kit import DESCRIPTOR_KEYS, compute_descriptors, compute_tdelta
 
 from iqc_dashboard.app import (
     build_descriptor_delta_hover_html,
@@ -19,6 +19,7 @@ from iqc_dashboard.app import (
     build_selected_descriptor_dataframe,
     compact_xyz_for_browser,
     extract_descriptor_keyword_options,
+    get_descriptor_definition,
 )
 
 
@@ -64,6 +65,7 @@ def test_build_descriptor_dataframe_uses_descriptor_kit_single_reaction():
     expected = compute_descriptors(
         read_example_xyz("type_I_reactant.xyz"),
         read_example_xyz("type_I_product.xyz"),
+        stereo_type="S",
     )
 
     values = {
@@ -86,6 +88,7 @@ def test_build_selected_descriptor_dataframe_uses_product_delta_g_plot_data():
     expected = compute_descriptors(
         read_example_xyz("type_I_reactant.xyz"),
         read_example_xyz("type_I_product.xyz"),
+        stereo_type="S",
     )
 
     assert len(descriptors) == 1
@@ -105,6 +108,7 @@ def test_build_selected_descriptor_dataframe_uses_reactant_geometry():
     expected = compute_descriptors(
         read_example_xyz("type_I_reactant.xyz"),
         read_example_xyz("type_I_product.xyz"),
+        stereo_type="S",
     )
 
     assert len(descriptors) == 1
@@ -116,6 +120,33 @@ def test_build_selected_descriptor_dataframe_uses_reactant_geometry():
     assert "_reactant_" in row["unique_name"]
 
 
+def test_new_alpha_beta_descriptors_are_registered_and_live_calculated():
+    """New PyA/PyB descriptors are available through descriptor_kit and the UI path."""
+    assert "reac_dB5_bpy" in DESCRIPTOR_KEYS
+    assert "reac_sigma_ortho_pyA" in DESCRIPTOR_KEYS
+    assert "reac_B5_ortho_pyA" in DESCRIPTOR_KEYS
+    assert "reac_abs_dB5_bpy" not in DESCRIPTOR_KEYS
+
+    df = build_example_reaction_df().iloc[:2].copy()
+    descriptors = build_selected_descriptor_dataframe(df, "reac_sigma_ortho_pyA")
+    expected = compute_descriptors(
+        read_example_xyz("type_I_reactant.xyz"),
+        read_example_xyz("type_I_product.xyz"),
+        stereo_type="S",
+    )
+
+    assert len(descriptors) == 1
+    assert descriptors.iloc[0]["value"] == pytest.approx(expected["reac_sigma_ortho_pyA"])
+
+
+def test_carboxylate_tilt_descriptor_uses_distance_units():
+    """The migrated carboxylate tilt is an O2 plane distance, not an angle."""
+    descriptor = get_descriptor_definition("prod_carboxylate_tilt")
+
+    assert descriptor is not None
+    assert descriptor["unit"] == "angstrom"
+
+
 def test_build_descriptor_dataframe_includes_tdelta_descriptors():
     """Type_I and Type_II reaction rows produce pair-level tdelta descriptors."""
     df = build_example_reaction_df()
@@ -124,10 +155,12 @@ def test_build_descriptor_dataframe_includes_tdelta_descriptors():
     type_i = compute_descriptors(
         read_example_xyz("type_I_reactant.xyz"),
         read_example_xyz("type_I_product.xyz"),
+        stereo_type="S",
     )
     type_ii = compute_descriptors(
         read_example_xyz("type_II_reactant.xyz"),
         read_example_xyz("type_II_product.xyz"),
+        stereo_type="S",
     )
     expected = compute_tdelta(type_i, type_ii)
 
@@ -147,10 +180,12 @@ def test_build_selected_descriptor_dataframe_includes_tdelta_delta_g():
     type_i = compute_descriptors(
         read_example_xyz("type_I_reactant.xyz"),
         read_example_xyz("type_I_product.xyz"),
+        stereo_type="S",
     )
     type_ii = compute_descriptors(
         read_example_xyz("type_II_reactant.xyz"),
         read_example_xyz("type_II_product.xyz"),
+        stereo_type="S",
     )
     expected = compute_tdelta(type_i, type_ii)
 

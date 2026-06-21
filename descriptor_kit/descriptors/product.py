@@ -185,16 +185,11 @@ def prod_co_len_mean(product):
 
 
 def prod_carboxylate_tilt(product):
-    """D43: angle between normal of plane{O1, Ccarb, O2} and normal of
-    best_fit_plane{Ni, N_A, N_B, O1, Cβ}, folded to 0..90°."""
+    """D43: out-of-plane distance of dangling O2 from the metallacycle plane."""
     geom, ni, o1, o2, ccarb, ca, cb, nA, nB = _check(product)
     c = geom.coords
-    _c1, n_carb, _r1 = g.best_fit_plane(c, [o1, ccarb, o2])
-    _c2, n_coord, _r2 = g.best_fit_plane(c, [ni, nA, nB, o1, cb])
-    cosv = float(np.dot(n_carb, n_coord)
-                 / (np.linalg.norm(n_carb) * np.linalg.norm(n_coord)))
-    theta = float(np.degrees(np.arccos(np.clip(cosv, -1.0, 1.0))))
-    return {"prod_carboxylate_tilt": min(theta, 180.0 - theta)}
+    centroid, normal, _rms = g.best_fit_plane(c, [ni, o1, ccarb, ca, cb])
+    return {"prod_carboxylate_tilt": abs(g.point_plane_distance(c[o2], centroid, normal))}
 
 
 def prod_ni_ccarb(product):

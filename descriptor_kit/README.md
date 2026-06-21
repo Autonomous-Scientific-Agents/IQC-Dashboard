@@ -6,16 +6,16 @@ row), as two standard xyz blocks. **Output:** a flat `dict` of that pair's
 descriptors.
 
 Every output key is produced by **exactly one function**, named identically to
-the key it returns (`reac_B5_R1`, `prod_tau4`, `tdelta_ni_Cb`, …). 90 functions
-total: 42 `reac_*` + 25 `prod_*` + 23 `tdelta_*`.
+the key it returns (`reac_B5_R1`, `prod_tau4`, `tdelta_ni_Cb`, …). 102 functions
+total: 54 `reac_*` + 25 `prod_*` + 23 `tdelta_*`.
 
 ## Usage
 
 ```python
 from descriptor_kit import compute_descriptors, compute_tdelta
 
-# Single reaction (reactant xyz + product xyz) -> 67 reac_*/prod_* descriptors.
-row = compute_descriptors(reactant_xyz, product_xyz)
+# Single reaction (reactant xyz + product xyz) -> 79 reac_*/prod_* descriptors.
+row = compute_descriptors(reactant_xyz, product_xyz, stereo_type="S")
 #   {"reac_sum_sigma_bpy": -1.66, ..., "prod_metallacycle_vbur": 34.63}
 
 # Regioisomer Δ: pass the two compute_descriptors results for the Type_I and
@@ -54,7 +54,7 @@ descriptor_kit/
 │   ├── sigma_data.py      #   curated Hammett/Taft sigma table
 │   └── steric.py          #   Sterimol / %V_bur / Bondi vdW volume (morfeus)
 ├── descriptors/
-│   ├── reactant.py        # 42 reac_* functions (take a Reactant)
+│   ├── reactant.py        # 54 reac_* functions (take a Reactant)
 │   ├── product.py         # 25 prod_* functions (take a Product)
 │   └── pair.py            # 23 tdelta_* functions (take two compute_descriptors results)
 └── example/

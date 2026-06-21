@@ -133,25 +133,37 @@ def role_smiles(row: pd.Series, role: str) -> str:
     return ""
 
 
-def _compute_descriptor_row(geometry_pair: tuple[str, str]) -> tuple[dict, int, bool]:
+def _compute_descriptor_row(geometry_pair: tuple[str, str, str]) -> tuple[dict, int, bool]:
     """Compute all single-reaction descriptors in a worker process."""
-    reactant_xyz, product_xyz = geometry_pair
+    reactant_xyz, product_xyz, stereo_type = geometry_pair
     diagnostics: list[tuple[str, str]] = []
     values = compute_descriptors(
         reactant_xyz,
         product_xyz,
+        stereo_type=stereo_type,
         diagnostics=diagnostics,
     )
     identification_failed = any(key == "_identification" for key, _ in diagnostics)
     return values, len(diagnostics), identification_failed
 
 
-def _descriptor_tasks(reaction_df: pd.DataFrame) -> Iterable[tuple[str, str]]:
+def _descriptor_tasks(reaction_df: pd.DataFrame) -> Iterable[tuple[str, str, str]]:
+    stereo_values = reaction_df.get(
+        "stereo_type",
+        pd.Series("", index=reaction_df.index),
+    )
     return (
-        (str(reactant_xyz), str(product_xyz))
-        for reactant_xyz, product_xyz in reaction_df[
-            ["reactant_geometry", "product_geometry"]
-        ].itertuples(index=False, name=None)
+        (
+            str(row.reactant_geometry),
+            str(row.product_geometry),
+            "" if pd.isna(stereo_type) else str(stereo_type),
+        )
+        for row, stereo_type in zip(
+            reaction_df[["reactant_geometry", "product_geometry"]].itertuples(
+                index=False,
+            ),
+            stereo_values,
+        )
     )
 
 

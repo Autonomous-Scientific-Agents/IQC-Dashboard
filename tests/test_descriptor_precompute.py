@@ -82,11 +82,15 @@ def test_precomputed_single_descriptor_matches_descriptor_kit(precomputed_df):
     expected = compute_descriptors(
         read_example_xyz("type_I_reactant.xyz"),
         read_example_xyz("type_I_product.xyz"),
+        stereo_type="S",
     )
 
     type_i_rows = precomputed_df[precomputed_df["source_json_row"] == 0]
     assert type_i_rows["prod_ni_o1"].tolist() == pytest.approx(
         [expected["prod_ni_o1"], expected["prod_ni_o1"]]
+    )
+    assert type_i_rows["reac_sigma_ortho_pyA"].tolist() == pytest.approx(
+        [expected["reac_sigma_ortho_pyA"], expected["reac_sigma_ortho_pyA"]]
     )
 
     with patch(
@@ -139,10 +143,12 @@ def test_precomputed_tdelta_matches_descriptor_kit_without_recalculation(precomp
     type_i = compute_descriptors(
         read_example_xyz("type_I_reactant.xyz"),
         read_example_xyz("type_I_product.xyz"),
+        stereo_type="S",
     )
     type_ii = compute_descriptors(
         read_example_xyz("type_II_reactant.xyz"),
         read_example_xyz("type_II_product.xyz"),
+        stereo_type="S",
     )
     expected = compute_tdelta(type_i, type_ii)
 

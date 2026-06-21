@@ -1,9 +1,9 @@
 """Public entry points for the descriptor kit.
 
-``compute_descriptors(reactant_xyz, product_xyz)``
+``compute_descriptors(reactant_xyz, product_xyz, stereo_type="")``
     The single-row API.  Takes the two xyz blocks of one reaction (a
     ``reactions.parquet`` row: a Ni·bpy·alkyne reactant and its Ni·bpy·carboxylate
-    metallacycle product) and returns a flat ``dict`` of all 67 ``reac_*`` /
+    metallacycle product) and returns a flat ``dict`` of all ``reac_*`` /
     ``prod_*`` descriptors.
 
 ``compute_tdelta(result_type_I, result_type_II)``
@@ -48,13 +48,18 @@ def _run_descriptor(fn, obj, out, strict):
 
 
 def compute_descriptors(reactant_xyz: str, product_xyz: str, *,
-                        strict: bool = False, diagnostics: list | None = None) -> dict:
+                        stereo_type: str = "",
+                        strict: bool = False,
+                        diagnostics: list | None = None) -> dict:
     """Compute every single-row descriptor for one reactant+product pair.
 
     Parameters
     ----------
     reactant_xyz, product_xyz : str
         xyz blocks (standard xyz: count line, comment line, then ``El x y z``).
+    stereo_type : str
+        Optional "S" / "O" label used to assign PyA/PyB for per-ring reactant
+        descriptors.
     strict : bool
         If True, the first failing descriptor (or identification step) raises.
         If False (default), failures become NaN and computation continues.
@@ -66,14 +71,16 @@ def compute_descriptors(reactant_xyz: str, product_xyz: str, *,
     Returns
     -------
     dict
-        ``{descriptor_key: float}`` for all 67 ``reac_*`` / ``prod_*`` keys.
+        ``{descriptor_key: float}`` for all ``reac_*`` / ``prod_*`` keys.
     """
     out = {k: float("nan") for k in DESCRIPTOR_KEYS}
 
     # --- build geoms + identify (one barrier: if this fails, all NaN) ---
     try:
         reactant = topo.identify_reactant(
-            geom_mod.build_geom(*geom_mod.parse_xyz(reactant_xyz)))
+            geom_mod.build_geom(*geom_mod.parse_xyz(reactant_xyz)),
+            stereo_type=stereo_type,
+        )
         product = topo.identify_product(
             geom_mod.build_geom(*geom_mod.parse_xyz(product_xyz)))
     except Exception as exc:  # noqa: BLE001

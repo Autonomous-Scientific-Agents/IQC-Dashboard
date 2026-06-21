@@ -29,6 +29,9 @@ class Reactant:
     r1_atoms: frozenset[int]     # R1 fragment (excludes c1, c2, Ni); incl H
     r2_atoms: frozenset[int]     # R2 fragment
     cip_source: str              # "cip" or "symmetric_atom_order" (pure CIP; no override)
+    stereo_type: str = ""        # "S" / "O" / "" from the reaction row
+    py_a_ring: frozenset[int] | None = None
+    py_b_ring: frozenset[int] | None = None
 
 @dataclass
 class Product:

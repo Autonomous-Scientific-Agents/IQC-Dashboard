@@ -6,7 +6,7 @@ Output: a flat dict of all single-row descriptors; a separate pair API yields th
 regioisomer-Δ (``tdelta_*``) descriptors.
 
     from descriptor_kit import compute_descriptors, compute_tdelta
-    row = compute_descriptors(reactant_xyz, product_xyz)   # 67 reac_*/prod_* keys
+    row = compute_descriptors(reactant_xyz, product_xyz, stereo_type="S")  # 79 keys
     deltas = compute_tdelta(row_type_I, row_type_II)        # 23 tdelta_* keys
 
 Alkyne C1/C2 labeling is pure CIP (no diaryl golden-rule override).
