@@ -1,5 +1,6 @@
 """Tests for descriptor_kit-backed molecular descriptor calculations."""
 
+import math
 import sys
 from pathlib import Path
 
@@ -9,9 +10,10 @@ import pytest
 # Add parent directory to path to import the module
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from descriptor_kit import DESCRIPTOR_KEYS, compute_descriptors, compute_tdelta
+from descriptor_kit import DESCRIPTOR_KEYS, REGIO_KEYS, compute_descriptors, compute_tdelta
 
 from iqc_dashboard.app import (
+    DESCRIPTOR_DEFINITIONS,
     build_descriptor_delta_hover_html,
     build_descriptor_dataframe,
     build_descriptor_reaction_pairs,
@@ -137,6 +139,60 @@ def test_new_alpha_beta_descriptors_are_registered_and_live_calculated():
 
     assert len(descriptors) == 1
     assert descriptors.iloc[0]["value"] == pytest.approx(expected["reac_sigma_ortho_pyA"])
+
+
+def test_regio_alpha_beta_descriptors_are_registered_as_reactant_descriptors():
+    """The 16 α/β regio descriptors are selectable reactant descriptors."""
+    defined_ids = {descriptor["id"] for descriptor in DESCRIPTOR_DEFINITIONS}
+    assert set(REGIO_KEYS).issubset(defined_ids)
+
+    for key in REGIO_KEYS:
+        definition = get_descriptor_definition(key)
+        assert definition is not None
+        assert definition["role"] == "reactant"
+
+    expected_units = {
+        "reac_dvol_alkyne_ab": "angstrom^3",
+        "reac_dvbur_substituent_ab": "percent",
+        "reac_dni_c_signed_ab": "angstrom",
+        "reac_dbend_alkyne_ab": "deg",
+        "reac_dccr_angle_ab": "deg",
+        "reac_dnicr_angle_ab": "deg",
+        "reac_slippage_ab": "angstrom",
+        "reac_dni_firstatom_ab": "angstrom",
+        "reac_B5_Ralpha": "angstrom",
+        "reac_B5_Rbeta": "angstrom",
+        "reac_L_Ralpha": "angstrom",
+        "reac_L_Rbeta": "angstrom",
+        "reac_bend_Ralpha": "deg",
+        "reac_bend_Rbeta": "deg",
+        "reac_ni_firstatom_Ralpha": "angstrom",
+        "reac_ni_firstatom_Rbeta": "angstrom",
+    }
+    assert set(expected_units) == set(REGIO_KEYS)
+    for key, unit in expected_units.items():
+        assert get_descriptor_definition(key)["unit"] == unit, key
+
+
+def test_regio_descriptors_registered_once_and_always_offered():
+    ids = [descriptor["id"] for descriptor in DESCRIPTOR_DEFINITIONS]
+    assert set(REGIO_KEYS).issubset(ids)
+    assert len(ids) == len(set(ids))  # no double-counting
+    for key in REGIO_KEYS:
+        assert get_descriptor_definition(key)["role"] == "reactant"
+
+
+def test_regio_descriptor_labels_render_alpha_beta_tokens():
+    """α/β dropdown labels read as Rα/Rβ/α-β, not raw Ralpha/Rbeta/ab tokens."""
+    assert get_descriptor_definition("reac_B5_Ralpha")["label"] == "Reactant: B5 Rα"
+    assert get_descriptor_definition("reac_B5_Rbeta")["label"] == "Reactant: B5 Rβ"
+    assert get_descriptor_definition("reac_dvol_alkyne_ab")["label"].endswith("α/β")
+
+    for key in REGIO_KEYS:
+        label = get_descriptor_definition(key)["label"]
+        assert "Ralpha" not in label
+        assert "Rbeta" not in label
+        assert not label.endswith(" ab")
 
 
 def test_carboxylate_tilt_descriptor_uses_distance_units():
@@ -357,3 +413,62 @@ def test_compact_xyz_for_browser_reduces_coordinate_precision():
         "C 1.123 -2.988 3.111",
         "H 0.000 0.000 0.000",
     ]
+
+
+def test_compute_descriptors_includes_regio_keys_with_insertion_type():
+    reactant = read_example_xyz("type_I_reactant.xyz")
+    product = read_example_xyz("type_I_product.xyz")
+    desc = compute_descriptors(
+        reactant, product, stereo_type="S", insertion_type="Type_I"
+    )
+    assert set(REGIO_KEYS).issubset(desc)
+    # Type_I negates signed diffs and swaps per-arm values.
+    assert desc["reac_dvol_alkyne_ab"] == pytest.approx(-desc["reac_dvol_alkyne"])
+    assert desc["reac_B5_Ralpha"] == pytest.approx(desc["reac_B5_R2"])
+    assert desc["reac_B5_Rbeta"] == pytest.approx(desc["reac_B5_R1"])
+
+
+def test_compute_descriptors_regio_is_nan_without_insertion_type():
+    reactant = read_example_xyz("type_I_reactant.xyz")
+    product = read_example_xyz("type_I_product.xyz")
+    desc = compute_descriptors(reactant, product, stereo_type="S")
+    for key in REGIO_KEYS:
+        assert math.isnan(desc[key]), key
+
+
+def test_descriptor_keys_include_regio_block():
+    assert DESCRIPTOR_KEYS[-len(REGIO_KEYS):] == list(REGIO_KEYS)
+    assert len(DESCRIPTOR_KEYS) == len(set(DESCRIPTOR_KEYS))
+
+
+def test_compute_regio_descriptors_matches_compute_descriptors():
+    from descriptor_kit import compute_regio_descriptors
+
+    reactant = read_example_xyz("type_I_reactant.xyz")
+    product = read_example_xyz("type_I_product.xyz")
+    full = compute_descriptors(
+        reactant, product, stereo_type="S", insertion_type="Type_I"
+    )
+    regio = compute_regio_descriptors(
+        reactant, stereo_type="S", insertion_type="Type_I"
+    )
+    assert set(regio) == set(REGIO_KEYS)
+    for key in REGIO_KEYS:
+        a, b = full[key], regio[key]
+        assert (math.isnan(a) and math.isnan(b)) or a == pytest.approx(b), key
+
+
+def test_regio_descriptor_is_live_computed_from_geometry():
+    df = build_example_reaction_df()  # raw, non-precomputed, has insertion_type
+    descriptors = build_selected_descriptor_dataframe(df, "reac_B5_Ralpha")
+    expected_type_i = compute_descriptors(
+        read_example_xyz("type_I_reactant.xyz"),
+        read_example_xyz("type_I_product.xyz"),
+        stereo_type="S",
+        insertion_type="Type_I",
+    )
+    assert len(descriptors) == 2  # one reactant record per regioisomer reaction
+    assert set(descriptors["role"]) == {"reactant"}
+    type_i = descriptors[descriptors["variant"].astype(str) == "Type_I"]
+    assert len(type_i) == 1
+    assert type_i.iloc[0]["value"] == pytest.approx(expected_type_i["reac_B5_Ralpha"])

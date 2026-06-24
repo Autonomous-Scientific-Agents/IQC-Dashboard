@@ -1,14 +1,25 @@
 """Tests for reaction JSON descriptor precomputation."""
 
+import math
 from pathlib import Path
 from unittest.mock import patch
 
+import numpy as np
 import pandas as pd
 import pytest
 
-from descriptor_kit import DESCRIPTOR_KEYS, TDELTA_KEYS, compute_descriptors, compute_tdelta
+from descriptor_kit import (
+    DESCRIPTOR_KEYS,
+    REGIO_KEYS,
+    TDELTA_KEYS,
+    compute_descriptors,
+    compute_tdelta,
+)
 from iqc_dashboard.app import ENERGY_UNIT_EV, build_selected_descriptor_dataframe
-from iqc_dashboard.descriptor_precompute import build_precomputed_descriptor_dataframe
+from iqc_dashboard.descriptor_precompute import (
+    PRECOMPUTE_VERSION,
+    build_precomputed_descriptor_dataframe,
+)
 
 
 EXAMPLE_DIR = Path(__file__).parent.parent / "descriptor_kit" / "example"
@@ -174,6 +185,94 @@ def test_precomputed_tdelta_matches_descriptor_kit_without_recalculation(precomp
     assert "Precomputed regioisomer" in records.loc[0, "atom_summary"]
 
 
+def _equal_or_both_nan(actual, expected) -> bool:
+    if math.isnan(actual) and math.isnan(expected):
+        return True
+    return actual == pytest.approx(expected)
+
+
+def _reactant_row(df: pd.DataFrame, source_json_row: int) -> pd.Series:
+    rows = df[
+        (df["source_json_row"] == source_json_row)
+        & (df["reaction_role"] == "reactant")
+    ]
+    assert len(rows) == 1
+    return rows.iloc[0]
+
+
+def test_precomputed_dataframe_includes_regio_columns(precomputed_df):
+    assert set(REGIO_KEYS).issubset(precomputed_df.columns)
+
+
+def test_precomputed_version_signals_regio_schema(precomputed_df):
+    assert PRECOMPUTE_VERSION >= 2
+    assert (precomputed_df["descriptor_precompute_version"] == PRECOMPUTE_VERSION).all()
+
+
+def test_precomputed_type_i_regio_swaps_and_negates(precomputed_df):
+    row = _reactant_row(precomputed_df, 0)  # Type_I reaction
+    # The swap must be observable, not vacuously NaN==NaN.
+    assert math.isfinite(row["reac_B5_R1"]) and math.isfinite(row["reac_B5_R2"])
+    assert row["reac_B5_R1"] != row["reac_B5_R2"]
+    assert math.isfinite(row["reac_dvol_alkyne"])
+    assert _equal_or_both_nan(row["reac_B5_Ralpha"], row["reac_B5_R2"])
+    assert _equal_or_both_nan(row["reac_B5_Rbeta"], row["reac_B5_R1"])
+    assert _equal_or_both_nan(row["reac_dvol_alkyne_ab"], -row["reac_dvol_alkyne"])
+
+
+def test_precomputed_type_ii_regio_passes_through(precomputed_df):
+    row = _reactant_row(precomputed_df, 1)  # Type_II reaction
+    assert math.isfinite(row["reac_B5_R1"]) and math.isfinite(row["reac_B5_R2"])
+    assert row["reac_B5_R1"] != row["reac_B5_R2"]
+    assert math.isfinite(row["reac_dvol_alkyne"])
+    assert _equal_or_both_nan(row["reac_B5_Ralpha"], row["reac_B5_R1"])
+    assert _equal_or_both_nan(row["reac_B5_Rbeta"], row["reac_B5_R2"])
+    assert _equal_or_both_nan(row["reac_dvol_alkyne_ab"], row["reac_dvol_alkyne"])
+
+
+def test_precompute_unknown_insertion_type_yields_nan_regio():
+    source = build_reaction_source_df()
+    extra = source.iloc[[0]].copy()
+    extra["insertion_type"] = "Type_III"
+    extra["ligand_pair"] = "other-pair"
+    source = pd.concat([source, extra], ignore_index=True)
+
+    out = build_precomputed_descriptor_dataframe(source, workers=1)
+    row = _reactant_row(out, 2)  # the unknown-insertion-type reaction
+    for key in REGIO_KEYS:
+        assert math.isnan(row[key])
+
+
+def test_regio_columns_round_trip_through_parquet(precomputed_df, tmp_path):
+    parquet_path = tmp_path / "regio_descriptors.parquet"
+    precomputed_df.to_parquet(parquet_path, index=False)
+    loaded_df = pd.read_parquet(parquet_path)
+
+    assert set(REGIO_KEYS).issubset(loaded_df.columns)
+    for key in REGIO_KEYS:
+        assert str(loaded_df[key].dtype) == "float64"
+        loaded = loaded_df[key].to_numpy(float)
+        original = precomputed_df[key].to_numpy(float)
+        assert ((loaded == original) | (np.isnan(loaded) & np.isnan(original))).all()
+
+
+def test_precomputed_regio_descriptor_is_selectable_without_recalculation(precomputed_df):
+    reactant_row = _reactant_row(precomputed_df, 0)  # Type_I reaction
+
+    with patch(
+        "iqc_dashboard.app.compute_selected_single_descriptor_value",
+        side_effect=AssertionError("live descriptor calculation should not run"),
+    ):
+        records = build_selected_descriptor_dataframe(precomputed_df, "reac_B5_Ralpha")
+
+    assert len(records) == 2  # one reactant record per regioisomer reaction
+    assert set(records["role"]) == {"reactant"}
+    type_i_record = records[records["variant"].astype(str) == "Type_I"]
+    assert len(type_i_record) == 1
+    assert type_i_record.iloc[0]["value"] == pytest.approx(reactant_row["reac_B5_Ralpha"])
+    assert type_i_record.iloc[0]["deltaG"] == pytest.approx(-5.0)
+
+
 def test_precomputed_dataframe_round_trips_through_parquet(precomputed_df, tmp_path):
     parquet_path = tmp_path / "reaction_descriptors.parquet"
     precomputed_df.to_parquet(parquet_path, index=False)
@@ -186,3 +285,13 @@ def test_precomputed_dataframe_round_trips_through_parquet(precomputed_df, tmp_p
     assert loaded_df["reactant_geometry"].tolist() == precomputed_df[
         "reactant_geometry"
     ].tolist()
+
+
+def test_descriptor_tasks_carry_insertion_type():
+    from iqc_dashboard.descriptor_precompute import _descriptor_tasks
+
+    source = build_reaction_source_df()
+    tasks = list(_descriptor_tasks(source))
+    assert all(len(task) == 4 for task in tasks)
+    assert tasks[0][3] == str(source.loc[0, "insertion_type"])
+    assert tasks[1][3] == str(source.loc[1, "insertion_type"])

@@ -224,7 +224,12 @@ streamlit run streamlit_app.py -- --data-path /Users/keceli/Downloads/reaction_d
 For large reaction JSON datasets, precompute all descriptor-tab values once and
 load the generated Parquet file. The output keeps every input JSON field, adds
 dashboard-compatible reactant/product rows, and stores all `reac_*`, `prod_*`,
-and `tdelta_*` descriptor columns:
+and `tdelta_*` descriptor columns, plus the 16 regiochemistry-resolved α/β
+reactant columns (`reac_*_ab`, `reac_*_Ralpha`, `reac_*_Rbeta`), which are
+populated only for rows whose `insertion_type` is `Type_I`/`Type_II`. The schema
+is tagged `descriptor_precompute_version=2`. The dashboard also computes these
+α/β columns live for non-precomputed data, so they appear in the descriptor
+dropdown even without a `descriptor_precompute_version=2` Parquet.
 
 ```bash
 python scripts/precompute_descriptor_parquet.py \

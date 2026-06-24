@@ -65,8 +65,10 @@ try:
         DESCRIPTOR_KEYS as KIT_DESCRIPTOR_KEYS,
         PRODUCT_KEYS as KIT_PRODUCT_KEYS,
         REACTANT_KEYS as KIT_REACTANT_KEYS,
+        REGIO_KEYS as KIT_REGIO_KEYS,
         TDELTA_KEYS as KIT_TDELTA_KEYS,
         compute_descriptors as kit_compute_descriptors,
+        compute_regio_descriptors as kit_compute_regio_descriptors,
         compute_tdelta as kit_compute_tdelta,
     )
     from descriptor_kit.core import geometry as kit_geometry
@@ -87,8 +89,10 @@ except Exception as e:  # noqa: BLE001 - show actionable runtime dependency erro
     KIT_REACTANT_KEYS = []
     KIT_PRODUCT_KEYS = []
     KIT_DESCRIPTOR_KEYS = []
+    KIT_REGIO_KEYS = []
     KIT_TDELTA_KEYS = []
     kit_compute_descriptors = None
+    kit_compute_regio_descriptors = None
     kit_compute_tdelta = None
     kit_geometry = None
     kit_topology = None
@@ -155,6 +159,9 @@ def descriptor_label_from_key(descriptor_key: str) -> str:
         "dvol": "ΔVolume",
         "rms": "RMS",
         "tau4": "τ4",
+        "ab": "α/β",
+        "Ralpha": "Rα",
+        "Rbeta": "Rβ",
     }
     tokens = [replacements.get(token, token) for token in core.split("_")]
     label = " ".join(tokens)
@@ -2990,6 +2997,7 @@ def build_single_reaction_descriptor_records(pair_entry: dict) -> Tuple[List[dic
             pair_entry["reactant_xyz"],
             pair_entry["product_xyz"],
             stereo_type=pair_entry.get("stereo_type", ""),
+            insertion_type=pair_entry.get("insertion_type", ""),
             diagnostics=diagnostics,
         )
     except Exception:
@@ -3256,10 +3264,29 @@ def compute_selected_single_descriptor_value(
     role: str,
     xyz_string: str,
     stereo_type: str = "",
+    insertion_type: str = "",
 ) -> Tuple[Optional[float], str]:
     """Compute one descriptor_kit value for one species geometry."""
     if kit_geometry is None or kit_topology is None:
         return None, "descriptor_kit geometry/topology modules are unavailable"
+
+    if descriptor_id in KIT_REGIO_KEYS:
+        if kit_compute_regio_descriptors is None:
+            return None, "descriptor_kit regio is unavailable"
+        if role != "reactant":
+            return None, f"{descriptor_id} is not a {role} descriptor"
+        try:
+            regio_values = kit_compute_regio_descriptors(
+                xyz_string,
+                stereo_type=stereo_type,
+                insertion_type=insertion_type,
+            )
+            value = regio_values.get(descriptor_id)
+        except Exception as exc:  # noqa: BLE001
+            return None, f"{type(exc).__name__}: {exc}"
+        if not is_finite_descriptor_value(value):
+            return None, "descriptor returned NaN"
+        return float(value), ""
 
     descriptor_function = selected_descriptor_function(descriptor_id, role)
     if descriptor_function is None:
@@ -3700,6 +3727,7 @@ def build_selected_single_descriptor_records(
                 role,
                 pair_entry[xyz_key],
                 stereo_type=pair_entry.get("stereo_type", ""),
+                insertion_type=pair_entry.get("insertion_type", ""),
             )
         if value is None:
             continue
