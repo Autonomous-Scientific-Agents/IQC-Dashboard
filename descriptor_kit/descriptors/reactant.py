@@ -27,7 +27,18 @@ from ..core import steric as st
 # --------------------------------------------------------------------------- #
 # private helpers (NOT descriptors)                                            #
 # --------------------------------------------------------------------------- #
-_BPY_INCLUDED_POSITIONS = frozenset({3, 4, 5})
+_BPY_INCLUDED_POSITIONS = frozenset({3, 4, 5, 6})
+_POS_CLASS = {3: "meta", 4: "para", 5: "meta", 6: "ortho"}
+_PERPOS_SIGMA_COLUMNS = [
+    f"reac_sigma_{cls}_{ring}"
+    for ring in ("pyA", "pyB")
+    for cls in ("ortho", "meta", "para")
+]
+_PERPOS_B5_COLUMNS = [
+    f"reac_B5_{cls}_{ring}"
+    for ring in ("pyA", "pyB")
+    for cls in ("ortho", "meta", "para")
+]
 
 
 def _isnan(x):
@@ -73,9 +84,9 @@ def _bpy_substituents(reactant):
 
 
 def _sum_bpy_sigma(reactant, ring_filter=None):
-    """Σ σ over bpy substituents at positions 3/4/5.  ``ring_filter`` restricts
+    """Σ σ over bpy substituents at positions 3/4/5/6.  ``ring_filter`` restricts
     the sum to substituents whose ring carbon lies in that ring (D3).  NaN if any
-    INCLUDED substituent's sigma is untabulated; position-6 (and 1/2) skipped."""
+    INCLUDED substituent's sigma is untabulated; positions 1/2 are skipped."""
     geom = reactant.geom
     total = 0.0
     for ring_atom, position, root, frag in _bpy_substituents(reactant):
@@ -88,6 +99,47 @@ def _sum_bpy_sigma(reactant, ring_filter=None):
             return float("nan")
         total += sigma
     return total
+
+
+def _perpos_sigma(reactant):
+    """Hammett sigma split by PyA/PyB and ortho/meta/para position class."""
+    assert reactant.bpy_ring_atoms, "reactant.bpy_ring_atoms is empty"
+    ring_a = reactant.py_a_ring
+    if ring_a is None or reactant.py_b_ring is None:
+        return {col: float("nan") for col in _PERPOS_SIGMA_COLUMNS}
+
+    geom = reactant.geom
+    out = {col: 0.0 for col in _PERPOS_SIGMA_COLUMNS}
+    for ring_atom, position, root, frag in _bpy_substituents(reactant):
+        cls = _POS_CLASS.get(position)
+        if cls is None:
+            continue
+        ring = "pyA" if ring_atom in ring_a else "pyB"
+        col = f"reac_sigma_{cls}_{ring}"
+        if _isnan(out[col]):
+            continue
+        sigma = hammett.sigma_for_fragment(geom, root, frag, position)
+        out[col] = float("nan") if _isnan(sigma) else out[col] + sigma
+    return out
+
+
+def _perpos_b5(reactant):
+    """Sterimol B5 split by PyA/PyB and ortho/meta/para position class."""
+    ring_a = reactant.py_a_ring
+    if ring_a is None or reactant.py_b_ring is None:
+        return {col: float("nan") for col in _PERPOS_B5_COLUMNS}
+
+    geom = reactant.geom
+    out = {col: 0.0 for col in _PERPOS_B5_COLUMNS}
+    for ring_atom, position, root, frag in _bpy_substituents(reactant):
+        cls = _POS_CLASS.get(position)
+        if cls is None:
+            continue
+        ring = "pyA" if ring_atom in ring_a else "pyB"
+        out[f"reac_B5_{cls}_{ring}"] += st.sterimol(geom, ring_atom, root, set(frag))["B5"]
+    for col, value in out.items():
+        assert np.isfinite(value) and value >= 0, f"B5 invalid for {col}: {value}"
+    return out
 
 
 def _sigma_R1(reactant):
@@ -143,7 +195,7 @@ def _vector_angle_deg(u, v):
 # §8.1 electronic (Hammett / Taft)                                            #
 # --------------------------------------------------------------------------- #
 def reac_sum_sigma_bpy(reactant):
-    """D1: Σ σ of all bpy substituents at positions 3/4/5 (both rings)."""
+    """D1: Σ σ of all bpy substituents at positions 3/4/5/6 (both rings)."""
     assert reactant.bpy_ring_atoms, "reactant.bpy_ring_atoms is empty"
     assert len(reactant.bpy_ring_atoms) == 12, (
         f"expected 12 bpy ring atoms, got {len(reactant.bpy_ring_atoms)}")
@@ -159,14 +211,15 @@ def reac_sum_sigma_alkyne(reactant):
 
 
 def reac_dsigma_pyA_pyB(reactant):
-    """D3: |σ(PyA) − σ(PyB)| (per-ring sums, positions 3/4/5)."""
+    """D3: σ(PyA) − σ(PyB), signed, over positions 3/4/5/6."""
     assert reactant.bpy_ring_atoms, "reactant.bpy_ring_atoms is empty"
-    ringA, ringB = topo.pyridine_rings(reactant)
-    sigA = _sum_bpy_sigma(reactant, ring_filter=ringA)
-    sigB = _sum_bpy_sigma(reactant, ring_filter=ringB)
+    if reactant.py_a_ring is None or reactant.py_b_ring is None:
+        return {"reac_dsigma_pyA_pyB": float("nan")}
+    sigA = _sum_bpy_sigma(reactant, ring_filter=reactant.py_a_ring)
+    sigB = _sum_bpy_sigma(reactant, ring_filter=reactant.py_b_ring)
     if _isnan(sigA) or _isnan(sigB):
         return {"reac_dsigma_pyA_pyB": float("nan")}
-    return {"reac_dsigma_pyA_pyB": abs(sigA - sigB)}
+    return {"reac_dsigma_pyA_pyB": sigA - sigB}
 
 
 def reac_dsigma_alkyne(reactant):
@@ -268,10 +321,12 @@ def reac_sum_B5_bpy(reactant):
     return {"reac_sum_B5_bpy": float(total)}
 
 
-def reac_abs_dB5_bpy(reactant):
-    """D15: |ΣB5(ringA) − ΣB5(ringB)| over bpy substituents."""
+def reac_dB5_bpy(reactant):
+    """D15: ΣB5(PyA) − ΣB5(PyB), signed, over bpy substituents."""
     geom = reactant.geom
-    ringA, ringB = topo.pyridine_rings(reactant)
+    ringA, ringB = reactant.py_a_ring, reactant.py_b_ring
+    if ringA is None or ringB is None:
+        return {"reac_dB5_bpy": float("nan")}
     sumA = sumB = 0.0
     for rc, _position, root, frag in _bpy_substituents(reactant):
         b5 = st.sterimol(geom, rc, root, set(frag))["B5"]
@@ -282,9 +337,9 @@ def reac_abs_dB5_bpy(reactant):
         else:
             raise ValueError(
                 f"D15: substituent ring carbon {rc} in neither pyridine ring")
-    val = abs(sumA - sumB)
+    val = sumA - sumB
     assert np.isfinite(val), f"D15 invalid: {val}"
-    return {"reac_abs_dB5_bpy": float(val)}
+    return {"reac_dB5_bpy": float(val)}
 
 
 # --------------------------------------------------------------------------- #
@@ -556,6 +611,66 @@ def reac_alkyne_bpy_dihedral(reactant):
     return {"reac_alkyne_bpy_dihedral": ang}
 
 
+def reac_sigma_ortho_pyA(reactant):
+    """D66: Hammett sigma at ortho position 6 of PyA."""
+    return {"reac_sigma_ortho_pyA": _perpos_sigma(reactant)["reac_sigma_ortho_pyA"]}
+
+
+def reac_sigma_meta_pyA(reactant):
+    """D66: Hammett sigma sum at meta positions 3/5 of PyA."""
+    return {"reac_sigma_meta_pyA": _perpos_sigma(reactant)["reac_sigma_meta_pyA"]}
+
+
+def reac_sigma_para_pyA(reactant):
+    """D66: Hammett sigma at para position 4 of PyA."""
+    return {"reac_sigma_para_pyA": _perpos_sigma(reactant)["reac_sigma_para_pyA"]}
+
+
+def reac_sigma_ortho_pyB(reactant):
+    """D66: Hammett sigma at ortho position 6 of PyB."""
+    return {"reac_sigma_ortho_pyB": _perpos_sigma(reactant)["reac_sigma_ortho_pyB"]}
+
+
+def reac_sigma_meta_pyB(reactant):
+    """D66: Hammett sigma sum at meta positions 3/5 of PyB."""
+    return {"reac_sigma_meta_pyB": _perpos_sigma(reactant)["reac_sigma_meta_pyB"]}
+
+
+def reac_sigma_para_pyB(reactant):
+    """D66: Hammett sigma at para position 4 of PyB."""
+    return {"reac_sigma_para_pyB": _perpos_sigma(reactant)["reac_sigma_para_pyB"]}
+
+
+def reac_B5_ortho_pyA(reactant):
+    """D67: Sterimol B5 at ortho position 6 of PyA."""
+    return {"reac_B5_ortho_pyA": _perpos_b5(reactant)["reac_B5_ortho_pyA"]}
+
+
+def reac_B5_meta_pyA(reactant):
+    """D67: Sterimol B5 sum at meta positions 3/5 of PyA."""
+    return {"reac_B5_meta_pyA": _perpos_b5(reactant)["reac_B5_meta_pyA"]}
+
+
+def reac_B5_para_pyA(reactant):
+    """D67: Sterimol B5 at para position 4 of PyA."""
+    return {"reac_B5_para_pyA": _perpos_b5(reactant)["reac_B5_para_pyA"]}
+
+
+def reac_B5_ortho_pyB(reactant):
+    """D67: Sterimol B5 at ortho position 6 of PyB."""
+    return {"reac_B5_ortho_pyB": _perpos_b5(reactant)["reac_B5_ortho_pyB"]}
+
+
+def reac_B5_meta_pyB(reactant):
+    """D67: Sterimol B5 sum at meta positions 3/5 of PyB."""
+    return {"reac_B5_meta_pyB": _perpos_b5(reactant)["reac_B5_meta_pyB"]}
+
+
+def reac_B5_para_pyB(reactant):
+    """D67: Sterimol B5 at para position 4 of PyB."""
+    return {"reac_B5_para_pyB": _perpos_b5(reactant)["reac_B5_para_pyB"]}
+
+
 # Ordered registry of every reactant descriptor function (one per output key).
 ALL = [
     reac_sum_sigma_bpy, reac_sum_sigma_alkyne, reac_dsigma_pyA_pyB,
@@ -563,7 +678,7 @@ ALL = [
     reac_B5_R1, reac_B5_R2, reac_B5_mean,
     reac_L_R1, reac_L_R2, reac_L_mean,
     reac_B1_R1, reac_B1_R2, reac_B1_mean,
-    reac_sum_B5_bpy, reac_abs_dB5_bpy, reac_bpy_dihedral,
+    reac_sum_B5_bpy, reac_dB5_bpy, reac_bpy_dihedral,
     reac_bend_R1, reac_bend_R2, reac_bend_mean,
     reac_ni_c_mean, reac_coordplane_rms, reac_n_ni_c_sum, reac_n_ni_c_std,
     reac_ni_alkyne_centroid, reac_ni_bpyplane_dist,
@@ -571,4 +686,8 @@ ALL = [
     reac_dni_c_signed, reac_dbend_alkyne, reac_dccr_angle, reac_dnicr_angle,
     reac_slippage, reac_ni_firstatom_R1, reac_ni_firstatom_R2,
     reac_dni_firstatom, reac_bulky_orientation, reac_alkyne_bpy_dihedral,
+    reac_sigma_ortho_pyA, reac_sigma_meta_pyA, reac_sigma_para_pyA,
+    reac_sigma_ortho_pyB, reac_sigma_meta_pyB, reac_sigma_para_pyB,
+    reac_B5_ortho_pyA, reac_B5_meta_pyA, reac_B5_para_pyA,
+    reac_B5_ortho_pyB, reac_B5_meta_pyB, reac_B5_para_pyB,
 ]

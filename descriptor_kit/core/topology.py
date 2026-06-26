@@ -109,8 +109,31 @@ def _bridgehead(geom, ring, donor, other_ring):
     raise ValueError(f"no bridgehead C adjacent to donor {donor}")
 
 
-def identify_reactant(geom):
+def _assign_pyridine_ab(geom, bpy_atoms, donors, ring_a, ring_b, stereo_type):
+    """Return the PyA/PyB ring assignment, or ``(None, None)`` if unassigned."""
+    n_a, n_b = donors
+    try:
+        cmp = cip.compare_ring_nitrogens(geom, bpy_atoms, n_a, n_b)
+    except Exception:  # noqa: BLE001 - descriptor layer converts unassigned rings to NaN
+        return None, None
+
+    if cmp == 0:
+        return (ring_a, ring_b) if n_a <= n_b else (ring_b, ring_a)
+
+    higher_ring, lower_ring = (ring_a, ring_b) if cmp > 0 else (ring_b, ring_a)
+    stereo = str(stereo_type or "").strip().upper()
+    if stereo == "O":
+        return higher_ring, lower_ring
+    if stereo == "S":
+        return lower_ring, higher_ring
+    return None, None
+
+
+def identify_reactant(geom, stereo_type=""):
     """Fill the Reactant dataclass from a reactant Geom (spec §5.1).
+
+    ``stereo_type`` ("S"/"O"/"") is used with donor-N CIP ranking to assign
+    PyA/PyB for per-ring descriptor differences.
 
     Guardrails: exactly 1 Ni; exactly 2 donor N; exactly 2 non-Ni organic
     components; exactly 1 alkyne C-C pair; each alkyne C has exactly one
@@ -169,6 +192,14 @@ def identify_reactant(geom):
     # --- CIP labeling (c1 = lower-priority substituent carbon, inverted) ---
     lab = cip.label_alkyne_carbons(geom, (cA, cB), r_a_root, r_b_root,
                                    r_a_atoms, r_b_atoms)
+    py_a_ring, py_b_ring = _assign_pyridine_ab(
+        geom,
+        bpy_atoms,
+        donors,
+        frozenset(ringA),
+        frozenset(ringB),
+        stereo_type,
+    )
 
     return Reactant(
         geom=geom,
@@ -182,6 +213,9 @@ def identify_reactant(geom):
         r1_atoms=lab["r1_atoms"],
         r2_atoms=lab["r2_atoms"],
         cip_source=lab["source"],
+        stereo_type=str(stereo_type or "").strip().upper(),
+        py_a_ring=py_a_ring,
+        py_b_ring=py_b_ring,
     )
 
 

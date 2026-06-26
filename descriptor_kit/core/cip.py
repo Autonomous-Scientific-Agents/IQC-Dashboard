@@ -53,7 +53,8 @@ def _build_alkyne_mol(geom, alkyne_pair, r_a_atoms, r_b_atoms):
 _PERIODIC = Chem.GetPeriodicTable()
 
 
-def _cip_compare_branches(mol, parent_a, root_a, parent_b, root_b):
+def _cip_compare_branches(mol, parent_a, root_a, parent_b, root_b,
+                          max_spheres=None):
     """Compare two CIP hierarchical digraphs by the standard sphere-by-sphere
     rule and return +1 if branch A outranks B, -1 if B outranks A, 0 if tied.
 
@@ -101,7 +102,8 @@ def _cip_compare_branches(mol, parent_a, root_a, parent_b, root_b):
     frontier_a = [(mol.GetAtomWithIdx(root_a).GetAtomicNum(), root_a, parent_a)]
     frontier_b = [(mol.GetAtomWithIdx(root_b).GetAtomicNum(), root_b, parent_b)]
 
-    max_spheres = 2 * mol.GetNumAtoms() + 4
+    if max_spheres is None:
+        max_spheres = 2 * mol.GetNumAtoms() + 4
     for _ in range(max_spheres):
         za = sorted((n[0] for n in frontier_a), reverse=True)
         zb = sorted((n[0] for n in frontier_b), reverse=True)
@@ -204,3 +206,54 @@ def label_alkyne_carbons(geom, alkyne_pair, r_a_root, r_b_root,
             "r1_root": r1_root, "r2_root": r2_root,
             "r1_atoms": r1_atoms, "r2_atoms": r2_atoms,
             "source": "cip"}
+
+
+def _build_bpy_mol(geom, bpy_atoms):
+    """Build a sanitized metal-free RDKit molecule for the bpy fragment."""
+    atoms = sorted(bpy_atoms)
+    remap = {a: i for i, a in enumerate(atoms)}
+
+    rw = Chem.RWMol()
+    conf = Chem.Conformer(len(atoms))
+    for i, a in enumerate(atoms):
+        assert geom.elements[a] != "Ni", "bpy fragment must be metal-free"
+        rw.AddAtom(Chem.Atom(geom.elements[a]))
+        conf.SetAtomPosition(i, [float(c) for c in geom.coords[a]])
+    for a in atoms:
+        for b in geom.adj[a]:
+            if b in remap and b > a:
+                rw.AddBond(remap[a], remap[b], Chem.BondType.SINGLE)
+
+    mol = rw.GetMol()
+    mol.AddConformer(conf)
+    rdDetermineBonds.DetermineBondOrders(mol, charge=0)
+    Chem.SanitizeMol(mol)
+    return mol, remap
+
+
+def compare_ring_nitrogens(geom, bpy_atoms, n_a, n_b, max_spheres=14):
+    """Rank the two bpy donor nitrogens by their ring environments.
+
+    Returns +1 if ``n_a`` outranks ``n_b``, -1 if ``n_b`` outranks ``n_a``, and
+    0 when the two rings are constitutionally equivalent.
+    """
+    mol, remap = _build_bpy_mol(geom, bpy_atoms)
+    ia, ib = remap[n_a], remap[n_b]
+    sym = list(Chem.CanonicalRankAtoms(mol, breakTies=False, includeChirality=False))
+    if sym[ia] == sym[ib]:
+        return 0
+
+    cmp = _cip_compare_branches(
+        mol,
+        parent_a=-1,
+        root_a=ia,
+        parent_b=-1,
+        root_b=ib,
+        max_spheres=max_spheres,
+    )
+    if cmp == 0:
+        raise ValueError(
+            "CIP could not resolve constitutionally-distinct pyridine N's "
+            f"within {max_spheres} spheres"
+        )
+    return cmp

@@ -31,7 +31,8 @@ def _xyz(name):
 def main():
     # --- single-row descriptors for the Type_I pair ---
     desc = compute_descriptors(_xyz("type_I_reactant.xyz"),
-                               _xyz("type_I_product.xyz"))
+                               _xyz("type_I_product.xyz"),
+                               stereo_type="S")
     print(f"{len(desc)} single-row descriptors (bundled Type_I reaction):")
     for k, v in desc.items():
         print(f"  {k:32s} {v:.6g}")
@@ -39,7 +40,8 @@ def main():
     # --- tdelta_* for the Type_I / Type_II regioisomer pair ---
     dI = desc
     dII = compute_descriptors(_xyz("type_II_reactant.xyz"),
-                              _xyz("type_II_product.xyz"))
+                              _xyz("type_II_product.xyz"),
+                              stereo_type="S")
     deltas = compute_tdelta(dI, dII)
     print(f"\n{len(deltas)} tdelta_* descriptors (Type_I - Type_II):")
     for k, v in deltas.items():
