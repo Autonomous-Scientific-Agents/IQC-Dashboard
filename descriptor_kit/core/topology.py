@@ -351,16 +351,19 @@ def bpy_ring_position(obj, ring_atom_idx):
     bridge = _bridgehead(geom, ring, donor, other)
 
     # Order the ring as a cycle starting donor -> bridge, then continue.
-    # Build cycle order by walking neighbours within the ring.
+    # Build cycle order by walking neighbours within the ring. Sort candidates
+    # by atom index so the walk direction is deterministic regardless of set
+    # iteration order — otherwise positions 3 vs 5 (both meta) can flip between
+    # runs, which would matter the moment any downstream code distinguishes
+    # them (e.g. adds a sigma_o table or a para/ortho split).
     ring_set = set(ring)
     order = [donor, bridge]
     while len(order) < 6:
         u = order[-1]
-        nxt = [v for v in adj[u]
-               if v in ring_set and v not in order]
+        nxt = sorted(v for v in adj[u]
+                     if v in ring_set and v not in order)
         # Avoid jumping straight back to donor before completing the ring.
-        if len(order) < 6:
-            nxt = [v for v in nxt if not (v == donor)]
+        nxt = [v for v in nxt if v != donor]
         assert nxt, f"ring walk stuck at {u}; ring {ring}"
         order.append(nxt[0])
 

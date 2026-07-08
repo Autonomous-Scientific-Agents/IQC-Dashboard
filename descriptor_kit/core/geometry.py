@@ -57,17 +57,30 @@ def build_geom(elements, coords):
     return Geom(elements=elements, coords=coords, adj=adj, ni=ni[0])
 
 
+_GEOM_EPS = 1e-9
+
+
 def angle(coords, a, b, c):
     u = coords[a] - coords[b]
     v = coords[c] - coords[b]
-    cosv = np.dot(u, v) / (np.linalg.norm(u) * np.linalg.norm(v))
+    nu = np.linalg.norm(u)
+    nv = np.linalg.norm(v)
+    if nu < _GEOM_EPS or nv < _GEOM_EPS:
+        # Coincident atoms — angle is undefined; surface as NaN rather than
+        # silently returning 0/90/180 from a divide-by-zero.
+        return float("nan")
+    cosv = np.dot(u, v) / (nu * nv)
     return float(np.degrees(np.arccos(np.clip(cosv, -1, 1))))
 
 
 def signed_dihedral(coords, a, b, c, d):
     p0, p1, p2, p3 = coords[a], coords[b], coords[c], coords[d]
     b0, b1, b2 = p0 - p1, p2 - p1, p3 - p2
-    b1u = b1 / np.linalg.norm(b1)
+    n1 = np.linalg.norm(b1)
+    if n1 < _GEOM_EPS:
+        # Middle bond has zero length — dihedral is undefined.
+        return float("nan")
+    b1u = b1 / n1
     v = b0 - np.dot(b0, b1u) * b1u
     w = b2 - np.dot(b2, b1u) * b1u
     x = np.dot(v, w)

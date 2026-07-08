@@ -140,7 +140,9 @@ def compute_regio_descriptors(reactant_xyz: str, *,
     return out
 
 
-def compute_tdelta(result_type_I: dict, result_type_II: dict) -> dict:
+def compute_tdelta(result_type_I: dict, result_type_II: dict, *,
+                   strict: bool = False,
+                   diagnostics: list | None = None) -> dict:
     """Compute the 23 ``tdelta_*`` regioisomer-Δ descriptors from two single-row
     results.
 
@@ -149,14 +151,27 @@ def compute_tdelta(result_type_I: dict, result_type_II: dict) -> dict:
     result_type_I, result_type_II : dict
         ``compute_descriptors`` outputs for the Type_I and Type_II regioisomers
         (only their ``prod_*`` keys are read).
+    strict : bool
+        If True, the first failing pair function raises. If False (default),
+        failures leave the affected keys NaN so one bad row cannot poison the
+        whole precompute batch.
+    diagnostics : list | None
+        If provided, ``(key, "ExcType: msg")`` tuples are appended for every
+        pair fn that failed — mirroring ``compute_descriptors``.
 
     Returns
     -------
     dict
         ``{tdelta_key: float}`` for all 23 keys (NaN where a source value is
-        missing or NaN).
+        missing or NaN, or where the pair fn failed under ``strict=False``).
     """
-    out = {}
+    out = {k: float("nan") for k in TDELTA_KEYS}
     for fn in pair_mod.ALL:
-        out.update(fn(result_type_I, result_type_II))
+        try:
+            out.update(fn(result_type_I, result_type_II))
+        except Exception as exc:  # noqa: BLE001 - per-descriptor NaN containment
+            if strict:
+                raise
+            if diagnostics is not None:
+                diagnostics.append((fn.__name__, f"{type(exc).__name__}: {exc}"))
     return out

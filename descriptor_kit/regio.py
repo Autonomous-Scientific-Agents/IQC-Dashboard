@@ -29,6 +29,8 @@ non-regioisomer rows.
 """
 from __future__ import annotations
 
+import warnings
+
 import numpy as np
 import pandas as pd
 
@@ -128,6 +130,14 @@ def add_regio_descriptors(df: pd.DataFrame) -> pd.DataFrame:
     if "insertion_type" in df.columns:
         normalized = df["insertion_type"].map(_normalize_insertion_type)
     else:
+        warnings.warn(
+            "add_regio_descriptors: 'insertion_type' column is absent; every "
+            "α/β column will be NaN. Pass a DataFrame that includes "
+            "'insertion_type' (values like 'Type_I'/'Type_II') to get non-NaN "
+            "regio descriptors.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
         normalized = pd.Series("", index=df.index)
     is_t1 = (normalized == "type_i").to_numpy()
     is_known = normalized.isin(("type_i", "type_ii")).to_numpy()
