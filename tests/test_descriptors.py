@@ -4,6 +4,7 @@ import math
 import sys
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 import pytest
 
@@ -22,6 +23,7 @@ from iqc_dashboard.app import (
     compact_xyz_for_browser,
     extract_descriptor_keyword_options,
     get_descriptor_definition,
+    hash_dataframe_for_streamlit,
 )
 
 
@@ -57,6 +59,34 @@ def build_example_reaction_df() -> pd.DataFrame:
                 }
             )
     return pd.DataFrame(rows)
+
+
+def test_streamlit_dataframe_hash_handles_numpy_array_cells():
+    """Cache hash remains deterministic when dataframe object cells contain arrays."""
+    df = pd.DataFrame(
+        {
+            "unique_name": ["mol_001"],
+            "spectrum": [np.array([100.0, 200.0, 300.0])],
+            "nested": [{"peaks": np.array([[1, 2], [3, 4]])}],
+        }
+    )
+    equivalent_df = pd.DataFrame(
+        {
+            "unique_name": ["mol_001"],
+            "spectrum": [np.array([100.0, 200.0, 300.0])],
+            "nested": [{"peaks": np.array([[1, 2], [3, 4]])}],
+        }
+    )
+    changed_df = pd.DataFrame(
+        {
+            "unique_name": ["mol_001"],
+            "spectrum": [np.array([100.0, 200.0, 301.0])],
+            "nested": [{"peaks": np.array([[1, 2], [3, 4]])}],
+        }
+    )
+
+    assert hash_dataframe_for_streamlit(df) == hash_dataframe_for_streamlit(equivalent_df)
+    assert hash_dataframe_for_streamlit(df) != hash_dataframe_for_streamlit(changed_df)
 
 
 def test_build_descriptor_dataframe_uses_descriptor_kit_single_reaction():

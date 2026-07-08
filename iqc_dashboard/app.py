@@ -15,6 +15,7 @@ from typing import Any, Dict, Optional, List, Tuple
 import numpy as np
 import re
 import difflib
+import functools
 import html
 import hashlib
 import json
@@ -243,6 +244,116 @@ def format_byte_size(value: Optional[int]) -> str:
     return "Unavailable"
 
 
+def _streamlit_cache_cell_token(value: Any) -> Any:
+    """Convert nested unhashable cell values into stable scalar cache tokens."""
+    if isinstance(value, np.ndarray):
+        array = np.asarray(value)
+        digest = hashlib.blake2b(digest_size=16)
+        digest.update(str(array.dtype).encode("utf-8"))
+        digest.update(repr(array.shape).encode("utf-8"))
+        if array.dtype == object:
+            digest.update(
+                repr(_streamlit_cache_cell_token(array.tolist())).encode(
+                    "utf-8",
+                    "backslashreplace",
+                )
+            )
+        else:
+            digest.update(np.ascontiguousarray(array).tobytes())
+        return ("ndarray", str(array.dtype), array.shape, digest.hexdigest())
+
+    if isinstance(value, (list, tuple)):
+        return tuple(_streamlit_cache_cell_token(item) for item in value)
+
+    if isinstance(value, dict):
+        items = [
+            (
+                _streamlit_cache_cell_token(key),
+                _streamlit_cache_cell_token(item_value),
+            )
+            for key, item_value in value.items()
+        ]
+        return tuple(sorted(items, key=repr))
+
+    if isinstance(value, set):
+        return tuple(
+            sorted(
+                (_streamlit_cache_cell_token(item) for item in value),
+                key=repr,
+            )
+        )
+
+    try:
+        hash(value)
+    except TypeError:
+        return repr(value)
+    return value
+
+
+def hash_dataframe_for_streamlit(df: pd.DataFrame) -> str:
+    """Hash dataframe cache inputs without pickling ndarray-valued object cells."""
+    digest = hashlib.blake2b(digest_size=32)
+    digest.update(
+        json.dumps(
+            {
+                "shape": df.shape,
+                "columns": [repr(column) for column in df.columns],
+                "dtypes": [str(dtype) for dtype in df.dtypes],
+            },
+            sort_keys=True,
+        ).encode("utf-8")
+    )
+
+    if df.empty:
+        return digest.hexdigest()
+
+    hash_df = df
+    object_column_names = [
+        column
+        for column, dtype in df.dtypes.items()
+        if pd.api.types.is_object_dtype(dtype)
+    ]
+    if object_column_names:
+        # Build a fresh dict of columns instead of assigning through .iloc on a
+        # shallow copy — under Pandas ≥ 2.2 copy-on-write, that assignment can
+        # silently no-op, producing a hash that ignores every object column.
+        hash_df = pd.DataFrame(
+            {
+                column: (
+                    df[column].map(_streamlit_cache_cell_token)
+                    if column in object_column_names
+                    else df[column]
+                )
+                for column in df.columns
+            },
+            index=df.index,
+        )
+
+    try:
+        row_hashes = pd.util.hash_pandas_object(
+            hash_df,
+            index=True,
+            categorize=False,
+        )
+    except (TypeError, ValueError):
+        fallback_df = df.astype("object").apply(
+            lambda column: column.map(
+                lambda value: repr(_streamlit_cache_cell_token(value))
+            )
+        )
+        row_hashes = pd.util.hash_pandas_object(
+            fallback_df,
+            index=True,
+            categorize=False,
+        )
+
+    digest.update(row_hashes.to_numpy(dtype=np.uint64, copy=False).tobytes())
+    return digest.hexdigest()
+
+
+STREAMLIT_HASH_FUNCS = {pd.DataFrame: hash_dataframe_for_streamlit}
+
+
 def run_git_diagnostic_command(*args: str) -> Optional[str]:
     """Run a read-only Git command for diagnostics."""
     repository_root = Path(__file__).resolve().parents[1]
@@ -398,6 +509,18 @@ def collect_host_diagnostic_info() -> Dict[str, str]:
 def format_diagnostic_section(values: Dict[str, str]) -> str:
     """Format diagnostic key/value pairs for a compact code block."""
     return "\n".join(f"{key}: {value}" for key, value in values.items())
+
+
+@st.cache_data(ttl=300)
+def _cached_git_diagnostic_info() -> Dict[str, str]:
+    """Cache git diagnostic subprocess calls; refreshed every 5 minutes."""
+    return collect_git_diagnostic_info()
+
+
+@st.cache_data(ttl=300)
+def _cached_host_diagnostic_info() -> Dict[str, str]:
+    """Cache host diagnostic subprocess calls; refreshed every 5 minutes."""
+    return collect_host_diagnostic_info()
 
 
 # Import 3D visualization libraries - will be checked when needed
@@ -3290,7 +3413,7 @@ def build_tdelta_descriptor_records(computed_pairs: List[dict]) -> List[dict]:
     return records
 
 
-@st.cache_data(ttl=3600, show_spinner=False)
+@st.cache_data(ttl=3600, show_spinner=False, hash_funcs=STREAMLIT_HASH_FUNCS)
 def build_descriptor_dataframe(
     df: pd.DataFrame,
     reactant_keywords: Optional[List[str]] = None,
@@ -4043,7 +4166,7 @@ def build_selected_tdelta_descriptor_records(
     return records
 
 
-@st.cache_data(ttl=3600, show_spinner=False)
+@st.cache_data(ttl=3600, show_spinner=False, hash_funcs=STREAMLIT_HASH_FUNCS)
 def build_selected_descriptor_dataframe(
     df: pd.DataFrame,
     descriptor_id: str,
@@ -5120,6 +5243,29 @@ def render_molecule(
 # ============================================================================
 
 
+@functools.lru_cache(maxsize=8192)
+def _parse_unique_name_cached(unique_name: str) -> tuple:
+    """Cached parse producing a hashable tuple; see ``parse_unique_name``."""
+    parts = unique_name.split("_")
+    bipyridine = None
+    alkyne = None
+    role = None
+
+    if parts and parts[0].lower() == "co2":
+        return (None, None, "co2")
+
+    if len(parts) >= 3:
+        bipyridine = parts[0].replace("bipy-", "")
+        alkyne = parts[1].replace("-C2H2-", "")
+        type_str = parts[2].lower()
+        if "product" in type_str:
+            role = "product"
+        elif "reactant" in type_str:
+            role = "reactant"
+
+    return (bipyridine, alkyne, role)
+
+
 def parse_unique_name(unique_name: str) -> dict:
     """
     Parse a unique_name string and extract bipyridine, alkyne, and role (reactant/product/co2).
@@ -5130,26 +5276,10 @@ def parse_unique_name(unique_name: str) -> dict:
     Returns:
         dict: {'bipyridine': ..., 'alkyne': ..., 'role': 'reactant' or 'product' or 'co2'}
     """
-    parts = unique_name.split("_")
-    result = {"bipyridine": None, "alkyne": None, "role": None}
-
-    # Check for CO2 first (case-insensitive)
-    if unique_name.lower().startswith("co2"):
-        result["role"] = "co2"
-        return result
-
-    # Standard parsing
-    if len(parts) >= 3:
-        result["bipyridine"] = parts[0].replace("bipy-", "")
-        result["alkyne"] = parts[1].replace("-C2H2-", "")
-
-        type_str = parts[2].lower()
-        if "product" in type_str:
-            result["role"] = "product"
-        elif "reactant" in type_str:
-            result["role"] = "reactant"
-
-    return result
+    # Return a fresh dict each call so callers can safely mutate the result;
+    # the heavy work (string splitting) is memoized on the underlying tuple.
+    bipyridine, alkyne, role = _parse_unique_name_cached(unique_name)
+    return {"bipyridine": bipyridine, "alkyne": alkyne, "role": role}
 
 
 def calculate_reaction_gibbs(
@@ -5186,15 +5316,22 @@ def calculate_reaction_gibbs(
     if len(df_co2) == 0:
         raise ValueError("No CO2 entries found — cannot compute ΔG.")
 
-    # Take the minimum G_eV for CO2
-    G_CO2 = df_co2["G_eV"].min()
+    # Take the minimum G_eV for CO2 across rows with usable energies. A silent
+    # NaN here would poison every downstream ΔG value, so refuse instead.
+    co2_energies = pd.to_numeric(df_co2["G_eV"], errors="coerce").dropna()
+    if co2_energies.empty:
+        raise ValueError("No CO2 entries with a numeric G_eV — cannot compute ΔG.")
+    G_CO2 = float(co2_energies.min())
 
     # Process complexes (exclude CO2)
     df_complexes = df2[df2["role"] != "co2"]
 
-    # For each (bipyridine, alkyne, role) combination, take lowest G conformer
+    # For each (bipyridine, alkyne, role) combination, take lowest G conformer.
+    # Drop all-NaN groups first so idxmin cannot return NaN indices (which would
+    # blow up df.loc[...] downstream).
     group_cols = ["bipyridine", "alkyne", "role"]
-    idx_min = df_complexes.groupby(group_cols)["G_eV"].idxmin()
+    df_complexes = df_complexes.dropna(subset=["G_eV"])
+    idx_min = df_complexes.groupby(group_cols)["G_eV"].idxmin().dropna().astype(int)
     df_lowest = df_complexes.loc[idx_min].reset_index(drop=True)
 
     # Extract reactants
@@ -5509,13 +5646,16 @@ def main(data_paths: Optional[List[str]] = None):
         key="energy_unit_select",
     )
 
-    # Diagnostic information (can be hidden with expander)
+    # Diagnostic information (can be hidden with expander). Streamlit renders
+    # expander bodies on every rerun even when collapsed, so cache the
+    # subprocess-heavy git/host lookups instead of re-spawning them on every
+    # widget interaction.
     with st.expander("🔧 Diagnostic Information", expanded=False):
         st.write("**Application Revision:**")
-        st.code(format_diagnostic_section(collect_git_diagnostic_info()))
+        st.code(format_diagnostic_section(_cached_git_diagnostic_info()))
 
         st.write("**Host Resources:**")
-        st.code(format_diagnostic_section(collect_host_diagnostic_info()))
+        st.code(format_diagnostic_section(_cached_host_diagnostic_info()))
 
         st.write("**Python Path:**")
         st.code("\n".join(sys.path[:3]))
@@ -5610,6 +5750,18 @@ def main(data_paths: Optional[List[str]] = None):
                 st.session_state.filter_smiles_changed = None
                 st.session_state.filter_max_imag = None
                 st.session_state.filter_text = ""
+                # Also clear the widget-bound keys; otherwise Streamlit repopulates
+                # the mirror keys above from the widgets' retained values on rerun
+                # and the reset appears to do nothing.
+                for widget_key in (
+                    "filter_formula_select",
+                    "filter_converged_select",
+                    "filter_smiles_changed_select",
+                    "filter_max_imag_toggle",
+                    "filter_max_imag_slider",
+                    "filter_text_input",
+                ):
+                    st.session_state.pop(widget_key, None)
                 st.rerun()
 
             st.markdown("---")
@@ -5642,17 +5794,24 @@ def main(data_paths: Optional[List[str]] = None):
             )
             st.session_state.filter_smiles_changed = selected_smiles_changed
 
-            # Imaginary frequency filter
-            max_imaginary = st.slider(
-                "Max Imaginary Frequencies",
-                min_value=0,
-                max_value=10,
-                value=None,
-                help="Filter to show only molecules with ≤ this many imaginary frequencies. None = No filter.",
-                key="filter_max_imag_slider",
+            # Imaginary frequency filter. st.slider rejects ``value=None`` and
+            # raises StreamlitAPIException, so gate the slider behind a checkbox
+            # (unchecked = "no filter", checked = apply the slider's value).
+            enable_max_imaginary = st.checkbox(
+                "Filter by max imaginary frequencies",
+                value=st.session_state.get("filter_max_imag") is not None,
+                key="filter_max_imag_toggle",
             )
-            if max_imaginary is not None:
-                st.session_state.filter_max_imag = max_imaginary
+            if enable_max_imaginary:
+                max_imaginary = st.slider(
+                    "Max Imaginary Frequencies",
+                    min_value=0,
+                    max_value=10,
+                    value=st.session_state.get("filter_max_imag") or 0,
+                    help="Show only molecules with ≤ this many imaginary frequencies.",
+                    key="filter_max_imag_slider",
+                )
+                st.session_state.filter_max_imag = int(max_imaginary)
             else:
                 st.session_state.filter_max_imag = None
 
