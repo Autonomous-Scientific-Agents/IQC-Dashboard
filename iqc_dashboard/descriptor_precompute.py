@@ -135,16 +135,25 @@ def role_smiles(row: pd.Series, role: str) -> str:
 
 
 def _compute_descriptor_row(geometry_pair: tuple[str, str, str, str]) -> tuple[dict, int, bool]:
-    """Compute all single-reaction descriptors in a worker process."""
+    """Compute all single-reaction descriptors in a worker process.
+
+    Any unexpected exception (malformed XYZ, RDKit crash, morfeus failure)
+    is contained here so a single bad row cannot abort a multi-hour precompute.
+    The row becomes all-NaN and its identification-failed flag is set to True.
+    """
     reactant_xyz, product_xyz, stereo_type, insertion_type = geometry_pair
     diagnostics: list[tuple[str, str]] = []
-    values = compute_descriptors(
-        reactant_xyz,
-        product_xyz,
-        stereo_type=stereo_type,
-        insertion_type=insertion_type,
-        diagnostics=diagnostics,
-    )
+    try:
+        values = compute_descriptors(
+            reactant_xyz,
+            product_xyz,
+            stereo_type=stereo_type,
+            insertion_type=insertion_type,
+            diagnostics=diagnostics,
+        )
+    except Exception as exc:  # noqa: BLE001 - one bad row must not kill the job
+        diagnostics.append(("_identification", f"{type(exc).__name__}: {exc}"))
+        values = {key: float("nan") for key in DESCRIPTOR_KEYS}
     identification_failed = any(key == "_identification" for key, _ in diagnostics)
     return values, len(diagnostics), identification_failed
 
@@ -187,20 +196,9 @@ def compute_single_reaction_descriptors(
     failure_counts = []
     identification_failures = []
 
-    if workers <= 1:
-        results = map(_compute_descriptor_row, _descriptor_tasks(reaction_df))
-        executor = None
-    else:
-        executor = ProcessPoolExecutor(max_workers=workers)
-        results = executor.map(
-            _compute_descriptor_row,
-            _descriptor_tasks(reaction_df),
-            chunksize=max(1, chunksize),
-        )
-
-    try:
+    def _drive(results_iterable) -> None:
         for completed, (values, failure_count, identification_failed) in enumerate(
-            results,
+            results_iterable,
             start=1,
         ):
             descriptor_rows.append(values)
@@ -208,9 +206,20 @@ def compute_single_reaction_descriptors(
             identification_failures.append(identification_failed)
             if progress is not None:
                 progress(completed, total)
-    finally:
-        if executor is not None:
-            executor.shutdown()
+
+    if workers <= 1:
+        _drive(map(_compute_descriptor_row, _descriptor_tasks(reaction_df)))
+    else:
+        # ``with`` ensures workers are shut down (and any pending futures
+        # cancelled) even if the driver loop raises or the caller Ctrl-C's.
+        with ProcessPoolExecutor(max_workers=workers) as executor:
+            _drive(
+                executor.map(
+                    _compute_descriptor_row,
+                    _descriptor_tasks(reaction_df),
+                    chunksize=max(1, chunksize),
+                )
+            )
 
     descriptor_df = pd.DataFrame(descriptor_rows, columns=DESCRIPTOR_KEYS, dtype=float)
     return (

@@ -13,9 +13,18 @@ PORT_SEARCH_LIMIT = 100
 
 
 def _is_port_available(host: str, port: int) -> bool:
-    """Return True when Streamlit can bind to host:port."""
+    """Return True when Streamlit can bind to host:port.
+
+    Note: this is a best-effort check. Between the moment we release the probe
+    socket here and the moment Streamlit rebinds in the child process another
+    process can grab the port. Streamlit itself will fail loudly if that
+    happens, so we accept the race rather than plumbing an inherited fd.
+    """
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            # Match how Streamlit itself binds so a socket lingering in
+            # TIME_WAIT does not produce a false "in use" result on macOS.
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             sock.bind((host, port))
     except OSError:
         return False

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 import time
 from pathlib import Path
@@ -119,7 +120,20 @@ def main() -> int:
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     compression = None if args.compression == "none" else args.compression
-    output_df.to_parquet(output_path, index=False, compression=compression)
+    # Atomic write: stage under a sibling temp path and rename on success so a
+    # crash mid-write cannot leave a truncated file that later reads mistake
+    # for a completed precompute.
+    tmp_path = output_path.with_name(output_path.name + ".tmp")
+    try:
+        output_df.to_parquet(tmp_path, index=False, compression=compression)
+        os.replace(tmp_path, output_path)
+    except BaseException:
+        if tmp_path.exists():
+            try:
+                tmp_path.unlink()
+            except OSError:
+                pass
+        raise
 
     elapsed = time.perf_counter() - start_time
     size_mb = output_path.stat().st_size / (1024 * 1024)
