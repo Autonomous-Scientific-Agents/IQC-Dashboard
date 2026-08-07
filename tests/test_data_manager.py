@@ -133,9 +133,71 @@ class TestDataManager:
         assert not descriptor_df.empty
         assert set(descriptor_df["role"]) == {"reactant", "product"}
 
+    def test_load_data_paths_leaves_iqc_parquet_unchanged(self, temp_dir, sample_parquet_file):
+        """Test IQC-schema Parquet files are not copied or modified."""
+        dm = DataManager(temp_dir)
+
+        loaded_paths = dm.load_data_paths([sample_parquet_file])
+
+        assert loaded_paths == [sample_parquet_file]
+
+    def test_load_data_paths_adapts_optimized_structure_parquet(self, temp_dir):
+        """Test optimized-only structure exports get IQC dashboard aliases."""
+        xyz = "2\n\nNi 0.0 0.0 0.0\nN 1.8 0.0 0.0\n"
+        parquet_path = Path(temp_dir) / "optimized_structures.parquet"
+        pd.DataFrame(
+            {
+                "structure_id": ["Ni-test-1"],
+                "formula": ["NNi"],
+                "n_atoms": [2],
+                "n_electrons": [35],
+                "geometry": [xyz],
+                "energy_eV": [-123.45],
+                "qc_passed": [True],
+                "opt_seconds": [12.5],
+                "model": ["MACE-POLAR-1-L"],
+                "complex_smiles": ["N->[Ni]"],
+            }
+        ).to_parquet(parquet_path, index=False)
+
+        dm = DataManager(temp_dir)
+        loaded_paths = dm.load_data_paths([str(parquet_path)])
+
+        assert len(loaded_paths) == 1
+        assert loaded_paths[0] != str(parquet_path)
+        loaded_df = pd.read_parquet(loaded_paths[0])
+        assert loaded_df["structure_id"].tolist() == ["Ni-test-1"]
+        assert loaded_df["unique_name"].tolist() == ["Ni-test-1"]
+        assert loaded_df["opt_xyz"].tolist() == [xyz]
+        assert loaded_df["opt_energy_eV"].tolist() == [-123.45]
+        assert loaded_df["number_of_atoms"].tolist() == [2]
+        assert loaded_df["number_of_electrons"].tolist() == [35]
+        assert loaded_df["opt_converged"].tolist() == [True]
+        assert loaded_df["opt_time"].tolist() == [12.5]
+        assert loaded_df["calculator"].tolist() == ["MACE-POLAR-1-L"]
+        assert loaded_df["task"].tolist() == ["opt"]
+        assert loaded_df["initial_smiles"].tolist() == ["N->[Ni]"]
+        assert loaded_df["opt_smiles"].tolist() == ["N->[Ni]"]
+        assert loaded_df["smiles_changed"].tolist() == [False]
+        assert "initial_xyz" not in loaded_df.columns
+        assert loaded_df["initial_energy_eV"].isna().all()
+
+        parquet_hash = dm._get_parquet_files_hash()
+        assert dm.get_all_molecule_names(parquet_hash) == ["Ni-test-1"]
+        filtered_df = dm.get_filtered_data(text_filter="Ni-test", limit=None)
+        assert filtered_df["unique_name"].tolist() == ["Ni-test-1"]
+        molecule = dm.get_molecule_by_name("Ni-test-1")
+        assert molecule is not None
+        assert molecule["opt_xyz"] == xyz
+
     @patch("iqc_dashboard.app.duckdb")
     def test_get_connection(self, mock_duckdb, temp_dir):
         """Test getting DuckDB connection."""
+        try:
+            DataManager.get_connection.clear()
+        except AttributeError:
+            pass
+
         mock_conn = Mock()
         mock_duckdb.connect.return_value = mock_conn
 

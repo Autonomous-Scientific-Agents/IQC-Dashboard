@@ -32,6 +32,21 @@ ENERGY_UNIT_KCAL = "kcal/mol"
 ENERGY_UNIT_EV = "eV"
 ENERGY_UNITS = [ENERGY_UNIT_KCAL, ENERGY_UNIT_EV]
 SUPPORTED_DATA_SUFFIXES = (".parquet", ".json")
+OPTIMIZED_STRUCTURE_PARQUET_MARKERS = frozenset(
+    {"structure_id", "geometry", "energy_eV"}
+)
+OPTIMIZED_STRUCTURE_PARQUET_ALIASES = (
+    ("unique_name", "structure_id"),
+    ("opt_xyz", "geometry"),
+    ("opt_energy_eV", "energy_eV"),
+    ("number_of_atoms", "n_atoms"),
+    ("number_of_electrons", "n_electrons"),
+    ("opt_converged", "qc_passed"),
+    ("opt_time", "opt_seconds"),
+    ("calculator", "model"),
+    ("initial_smiles", "complex_smiles"),
+    ("opt_smiles", "complex_smiles"),
+)
 COVALENT_RADII_ANGSTROM = {
     "H": 0.31,
     "B": 0.85,
@@ -610,12 +625,51 @@ class DataManager:
         """Return a Parquet path that DuckDB can query for a supported data file."""
         suffix = path.suffix.lower()
         if suffix == ".parquet":
-            return path
+            return self.prepare_parquet_file(path)
         if suffix == ".json":
             return self.convert_json_to_parquet(path)
 
         st.warning(f"Skipping unsupported data file: {path}")
         return None
+
+    def prepare_parquet_file(self, parquet_path: Path) -> Optional[Path]:
+        """Return a dashboard-queryable Parquet path, adding safe aliases if needed."""
+        try:
+            column_names = read_parquet_column_names(parquet_path)
+        except Exception as e:
+            st.warning(f"Unable to inspect Parquet file {parquet_path}: {e}")
+            return parquet_path
+
+        if not is_optimized_structure_parquet_schema(column_names):
+            return parquet_path
+
+        if not optimized_structure_parquet_needs_aliases(column_names):
+            return parquet_path
+
+        try:
+            parquet_df = pd.read_parquet(parquet_path)
+            parquet_df = normalize_optimized_structure_parquet_dataframe(parquet_df)
+            if parquet_df.empty:
+                st.warning(f"No rows found in Parquet file: {parquet_path}")
+                return parquet_path
+
+            file_stamp = ""
+            try:
+                stat = parquet_path.stat()
+                file_stamp = f":{stat.st_mtime_ns}:{stat.st_size}"
+            except OSError:
+                pass
+            digest = hashlib.md5(
+                f"{parquet_path.resolve()}{file_stamp}:optimized-structure".encode()
+            ).hexdigest()[:10]
+            normalized_path = (
+                self.temp_dir / f"{parquet_path.stem}_iqc_dashboard_{digest}.parquet"
+            )
+            parquet_df.to_parquet(normalized_path, index=False)
+            return normalized_path
+        except Exception as e:
+            st.warning(f"Unable to adapt Parquet file {parquet_path}: {e}")
+            return parquet_path
 
     def convert_json_to_parquet(self, json_path: Path) -> Optional[Path]:
         """Convert a JSON data file into a temporary Parquet file."""
@@ -1187,6 +1241,68 @@ class DataManager:
 # ============================================================================
 # Data Normalization Helper Functions
 # ============================================================================
+
+
+def read_parquet_column_names(parquet_path: Path) -> Tuple[str, ...]:
+    """Read Parquet column names from metadata without loading the full dataset."""
+    try:
+        import pyarrow.parquet as pq
+
+        return tuple(pq.ParquetFile(parquet_path).schema_arrow.names)
+    except Exception:
+        return tuple(pd.read_parquet(parquet_path).columns)
+
+
+def is_optimized_structure_parquet_schema(column_names: Tuple[str, ...]) -> bool:
+    """Return True for optimized-structure exports that need IQC dashboard aliases."""
+    return OPTIMIZED_STRUCTURE_PARQUET_MARKERS.issubset(set(column_names))
+
+
+def optimized_structure_parquet_needs_aliases(column_names: Tuple[str, ...]) -> bool:
+    """Return True when a recognized optimized-structure export lacks aliases."""
+    columns = set(column_names)
+    alias_targets = {
+        target
+        for target, source in OPTIMIZED_STRUCTURE_PARQUET_ALIASES
+        if source in columns
+    }
+    default_targets = {
+        "task",
+        "initial_energy_eV",
+        "number_of_imaginary",
+        "smiles_changed",
+    }
+    return bool((alias_targets | default_targets) - columns)
+
+
+def normalize_optimized_structure_parquet_dataframe(df: pd.DataFrame) -> pd.DataFrame:
+    """Add IQC dashboard aliases to optimized-only structure exports."""
+    normalized_df = df.copy()
+
+    for target_column, source_column in OPTIMIZED_STRUCTURE_PARQUET_ALIASES:
+        if target_column not in normalized_df.columns and source_column in normalized_df.columns:
+            normalized_df[target_column] = normalized_df[source_column]
+
+    if "calculator" not in normalized_df.columns:
+        normalized_df["calculator"] = "unknown"
+    if "task" not in normalized_df.columns:
+        normalized_df["task"] = "opt"
+    if "initial_energy_eV" not in normalized_df.columns:
+        normalized_df["initial_energy_eV"] = np.nan
+    if "number_of_imaginary" not in normalized_df.columns:
+        normalized_df["number_of_imaginary"] = np.nan
+
+    if "initial_smiles" not in normalized_df.columns:
+        normalized_df["initial_smiles"] = ""
+    if "opt_smiles" not in normalized_df.columns:
+        normalized_df["opt_smiles"] = ""
+    if "smiles_changed" not in normalized_df.columns:
+        normalized_df["smiles_changed"] = (
+            normalized_df["initial_smiles"].fillna("").astype(str)
+            != normalized_df["opt_smiles"].fillna("").astype(str)
+        )
+
+    return normalized_df
 
 
 def normalize_json_dataframe(json_df: pd.DataFrame) -> pd.DataFrame:
@@ -2312,10 +2428,14 @@ def normalize_element_symbol(raw_symbol: str) -> Optional[str]:
 
 def parse_xyz_coordinates(xyz_string: str) -> Optional[Tuple[List[str], np.ndarray]]:
     """Parse XYZ text into element symbols and coordinates."""
-    if not xyz_string or is_missing_scalar(xyz_string):
+    if is_missing_scalar(xyz_string):
         return None
 
-    raw_lines = [line.strip() for line in str(xyz_string).splitlines()]
+    xyz_text = str(xyz_string)
+    if not xyz_text.strip():
+        return None
+
+    raw_lines = [line.strip() for line in xyz_text.splitlines()]
     if not raw_lines or not any(raw_lines):
         return None
 
@@ -5208,22 +5328,24 @@ def render_molecule(
         st.code("pip install py3Dmol", language="bash")
         return
 
-    if not xyz_string or pd.isna(xyz_string):
+    if is_missing_scalar(xyz_string) or not str(xyz_string).strip():
         st.warning(f"No XYZ data available for {label}")
         return
 
     try:
+        xyz_text = str(xyz_string)
+
         # Import here to ensure they're available
         import stmol
         import py3Dmol
 
         # Create py3Dmol viewer
         view = py3Dmol.view(width=400, height=400)
-        view.addModel(xyz_string, "xyz")
+        view.addModel(xyz_text, "xyz")
 
         set_molecule_style(view, style)
         if show_labels:
-            add_atom_labels(view, xyz_string)
+            add_atom_labels(view, xyz_text)
 
         view.zoomTo()
         view.render()
@@ -6008,7 +6130,10 @@ def main(data_paths: Optional[List[str]] = None):
                     st.write(formula)  # Display full formula without cutting
                 with col2:
                     converged = molecule_data.get("opt_converged", None)
-                    status = "✅ Converged" if converged else "❌ Not Converged"
+                    if is_missing_scalar(converged):
+                        status = "N/A"
+                    else:
+                        status = "✅ Converged" if bool(converged) else "❌ Not Converged"
                     st.metric("Status", status)
 
                 # Row 2: Energy values
@@ -6400,38 +6525,44 @@ def main(data_paths: Optional[List[str]] = None):
                 energy_plot_df["opt_energy_eV"],
                 energy_unit,
             )
-            fig_scatter = px.scatter(
-                energy_plot_df,
-                x="initial_energy_display",
-                y="opt_energy_display",
-                color="opt_converged",
-                hover_data=["formula", "unique_name"],
-                labels={
-                    "initial_energy_display": f"Initial Energy ({energy_unit})",
-                    "opt_energy_display": f"Optimized Energy ({energy_unit})",
-                    "opt_converged": "Converged",
-                },
-                title="Initial vs Optimized Energy",
+            energy_plot_df = energy_plot_df.dropna(
+                subset=["initial_energy_display", "opt_energy_display"]
             )
-            # Add diagonal line
-            min_energy = min(
-                energy_plot_df["initial_energy_display"].min(),
-                energy_plot_df["opt_energy_display"].min(),
-            )
-            max_energy = max(
-                energy_plot_df["initial_energy_display"].max(),
-                energy_plot_df["opt_energy_display"].max(),
-            )
-            fig_scatter.add_trace(
-                go.Scatter(
-                    x=[min_energy, max_energy],
-                    y=[min_energy, max_energy],
-                    mode="lines",
-                    line=dict(dash="dash", color="gray"),
-                    name="y=x",
+            if energy_plot_df.empty:
+                st.warning("Initial/optimized energy pairs are not available in dataset.")
+            else:
+                fig_scatter = px.scatter(
+                    energy_plot_df,
+                    x="initial_energy_display",
+                    y="opt_energy_display",
+                    color="opt_converged",
+                    hover_data=["formula", "unique_name"],
+                    labels={
+                        "initial_energy_display": f"Initial Energy ({energy_unit})",
+                        "opt_energy_display": f"Optimized Energy ({energy_unit})",
+                        "opt_converged": "Converged",
+                    },
+                    title="Initial vs Optimized Energy",
                 )
-            )
-            st.plotly_chart(fig_scatter, width="stretch")
+                # Add diagonal line
+                min_energy = min(
+                    energy_plot_df["initial_energy_display"].min(),
+                    energy_plot_df["opt_energy_display"].min(),
+                )
+                max_energy = max(
+                    energy_plot_df["initial_energy_display"].max(),
+                    energy_plot_df["opt_energy_display"].max(),
+                )
+                fig_scatter.add_trace(
+                    go.Scatter(
+                        x=[min_energy, max_energy],
+                        y=[min_energy, max_energy],
+                        mode="lines",
+                        line=dict(dash="dash", color="gray"),
+                        name="y=x",
+                    )
+                )
+                st.plotly_chart(fig_scatter, width="stretch")
         else:
             st.warning("Energy columns not available in dataset.")
 

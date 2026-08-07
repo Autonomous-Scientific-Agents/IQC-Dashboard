@@ -4,6 +4,7 @@ from unittest.mock import patch, MagicMock
 import sys
 from pathlib import Path
 import pytest
+import pandas as pd
 
 # Add parent directory to path to import the module
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -36,6 +37,12 @@ class TestRenderMolecule:
         """Test render_molecule with empty XYZ string."""
         with patch("iqc_dashboard.app.st") as mock_st:
             render_molecule("", label="Test")
+            mock_st.warning.assert_called()
+
+    def test_render_molecule_with_nullable_xyz(self):
+        """Test render_molecule with a pandas nullable scalar."""
+        with patch("iqc_dashboard.app.st") as mock_st:
+            render_molecule(pd.NA, label="Test")
             mock_st.warning.assert_called()
 
     def test_render_molecule_without_stmol(self):
