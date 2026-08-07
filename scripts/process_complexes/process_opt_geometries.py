@@ -6,12 +6,9 @@
 
 import pandas as pd
 import json
-import matplotlib.pyplot as plt
-import seaborn as sns
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 import numpy as np
-from scipy.spatial.distance import pdist, squareform
 from rdkit import Chem
 from rdkit.Chem import rdDetermineBonds
 from rdkit.Chem import AllChem
@@ -203,11 +200,7 @@ def classify_ni_geometry(xyz_str, determine_stereo=True):
         excluded_atoms = set(excluded_atoms) | {atom_idx1, atom_idx2}
         # Build automol graph from RDKit connectivity (to avoid VanderWaalsRadii error for Ni)
         # Extract atom symbols and coordinates
-        conf = mol.GetConformer()
         symbols = tuple(atom.GetSymbol() for atom in mol.GetAtoms())
-        coords = tuple(
-            tuple(conf.GetAtomPosition(i)) for i in range(mol.GetNumAtoms())
-        )
         
         # Extract bonds from RDKit
         bond_keys = []
@@ -547,7 +540,6 @@ def classify_ni_geometry(xyz_str, determine_stereo=True):
     
     # Find the pair of atoms with the largest angle (likely trans if exists)
     max_angle = 0
-    best_pair = (0, 1)
     for i in range(4):
         for j in range(i+1, 4):
             cos_angle = np.dot(vectors_norm[i], vectors_norm[j])
@@ -555,7 +547,6 @@ def classify_ni_geometry(xyz_str, determine_stereo=True):
             angle = np.degrees(np.arccos(cos_angle))
             if angle > max_angle:
                 max_angle = angle
-                best_pair = (i, j)
     
     # Split atoms into two pairs
     pair1 = tuple(n_indices)  
@@ -897,4 +888,3 @@ if __name__ == "__main__":
         reaction_df = get_reaction_parquet(df_labeled)
         reaction_df.to_json(reaction_json_file)
         print(f"Reaction-level data saved to {reaction_json_file}")
-

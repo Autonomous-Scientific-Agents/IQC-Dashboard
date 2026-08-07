@@ -4,7 +4,6 @@ import json
 import argparse
 import io
 import multiprocessing as mp
-from itertools import islice  
 from contextlib import redirect_stdout, redirect_stderr
 
 from architector import build_complex
@@ -76,7 +75,7 @@ def write_structure_xyz(outdict: dict, filename: str = "structure.xyz"):
             written_files.append(current_filename)
             print(f"Wrote structure {idx}/{num_structures} to {current_filename}")
             
-        except (KeyError, AttributeError) as e:
+        except (KeyError, AttributeError):
             print(f"Error in structure data format for key {key}:")
             print(f"Structure data: {struct_data}")
             raise
@@ -163,7 +162,7 @@ def process_single_ligand(key, out_dir, ligand_sets, process_num, selected_mol_t
                 try:
                     with redirect_stdout(buf_out), redirect_stderr(buf_err):
                         result = build_complex(input_dict)
-                except Exception as e:
+                except Exception:
                     # Report the exception (outside the redirected context) and continue
                     result = build_complex(input_dict)
                     if not result:
@@ -172,11 +171,11 @@ def process_single_ligand(key, out_dir, ligand_sets, process_num, selected_mol_t
                 try:
                     # Save result to individual XYZ file in geometries directory
                     base_filename = os.path.join(out_dir, f"{key}_{mol_typ}.xyz")
-                    written_files = write_structure_xyz(result, base_filename)
-                except Exception as e:
+                    write_structure_xyz(result, base_filename)
+                except Exception:
                     continue
 
-            except Exception as e:
+            except Exception:
                 continue
 
     print(f"\nCompleted processor {process_num} on key: {key}.")
@@ -241,7 +240,7 @@ def main():
         print(f"Error: Starting entry {args.start_entry} is out of range. Total entries: {total_entries}")
         return
     if args.start_entry + args.num_entries > total_entries:
-        print(f"Warning: Requested more entries than available. Processing until end.")
+        print("Warning: Requested more entries than available. Processing until end.")
         args.num_entries = total_entries - args.start_entry
     
     # Get this node's entries

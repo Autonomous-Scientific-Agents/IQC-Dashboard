@@ -1,8 +1,6 @@
 import numpy as np
 import os
 import glob
-import shutil
-from pathlib import Path
 
 def read_xyz(filename):
     """Read xyz file and return atom types and coordinates."""
@@ -166,9 +164,6 @@ def fix_hypervalent_atoms(atoms, coords, bipy_indices, bond_thresholds):
                 connectivity[i].append((j, dist))
                 connectivity[j].append((i, dist))
     
-    # Check for hypervalent atoms
-    atoms_to_remove = set()
-    
     for idx in bipy_indices:
         atom_type = atoms[idx]
         max_bonds = max_valency.get(atom_type, 6)  # Default to 6 for unknown types
@@ -178,7 +173,6 @@ def fix_hypervalent_atoms(atoms, coords, bipy_indices, bond_thresholds):
         if len(connections) > max_bonds:
             # Atom is hypervalent - keep only the shortest bonds
             connections_sorted = sorted(connections, key=lambda x: x[1])
-            keep_connections = set(conn[0] for conn in connections_sorted[:max_bonds])
             
             # Mark the longer "bonds" for removal from the other atoms' connectivity
             for other_idx, dist in connections_sorted[max_bonds:]:
@@ -536,11 +530,11 @@ if __name__ == '__main__':
         
         if result:
             print(f"Ni atom index: {result['ni_index']}")
-            print(f"\nClosest 2 N atoms:")
+            print("\nClosest 2 N atoms:")
             for i, (idx, dist) in enumerate(zip(result['n_indices'], result['n_distances'])):
                 print(f"  N {i+1}: atom index {idx}, distance = {dist:.4f} Å")
             
-            print(f"\nClosest 2 C atoms:")
+            print("\nClosest 2 C atoms:")
             for i, (idx, dist) in enumerate(zip(result['c_indices'], result['c_distances'])):
                 print(f"  C {i+1}: atom index {idx}, distance = {dist:.4f} Å")
             
@@ -551,7 +545,7 @@ if __name__ == '__main__':
             
             # Check for inconsistency
             if expected_geometry != 'unknown' and result['geometry_type'] != expected_geometry:
-                print(f"\n⚠️  WARNING: Geometry mismatch!")
+                print("\n⚠️  WARNING: Geometry mismatch!")
                 print(f"   Expected: {expected_geometry}, Found: {result['geometry_type']}")
                 flagged_files.append((xyz_file, expected_geometry, result['geometry_type']))
             
@@ -573,7 +567,7 @@ if __name__ == '__main__':
             bipy_asym, alkyne_asym = parse_filename_for_asymmetry(xyz_file)
             should_mirror = should_create_mirror(xyz_file, result['angle'])
             
-            print(f"\nAsymmetry analysis:")
+            print("\nAsymmetry analysis:")
             print(f"  Bipyridine asymmetric: {bipy_asym}")
             print(f"  Alkyne asymmetric: {alkyne_asym}")
             print(f"  Angle close to 90°: {abs(result['angle'] - 90.0) < 10.0}")
@@ -690,7 +684,7 @@ if __name__ == '__main__':
                 moved_count += 1
             except FileNotFoundError:
                 # File might have already been moved to flagged directory
-                print(f"    Note: File not found (may have been moved to flagged directory)")
+                print("    Note: File not found (may have been moved to flagged directory)")
             except Exception as e:
                 print(f"    Error moving file: {e}")
             print()
@@ -747,4 +741,3 @@ if __name__ == '__main__':
         print(f"✓ Created all_mirrored.xyz with {len(mirrored_structures)} structures")
         print("\nYou can now open both files in molden and scroll through them to compare.")
         print()
-

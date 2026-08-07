@@ -284,13 +284,13 @@ def main():
                     print(f'  -> skipping copy to {faildir}: matching label in {tested_dir}')
                     pass
                 else:
-                    dest = copy_with_suffix(f, faildir)
+                    copy_with_suffix(f, faildir)
             except Exception as e:
                 print('  -> copy failed:', e)
         else:
             passed += 1
             try:
-                dest = copy_with_suffix(f, outdir)
+                copy_with_suffix(f, outdir)
             except Exception as e:
                 print('  -> copy failed:', e)
 
@@ -305,5 +305,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-
-

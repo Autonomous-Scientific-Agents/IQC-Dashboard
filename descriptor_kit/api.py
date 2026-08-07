@@ -23,7 +23,7 @@ from .core import topology as topo
 from .descriptors import reactant as reac_mod
 from .descriptors import product as prod_mod
 from .descriptors import pair as pair_mod
-from .regio import REGIO_KEYS, add_regio_descriptors, compute_regio
+from .regio import REGIO_KEYS, add_regio_descriptors as add_regio_descriptors, compute_regio
 
 
 # Output key order: reactant block, then product block, then regio block
