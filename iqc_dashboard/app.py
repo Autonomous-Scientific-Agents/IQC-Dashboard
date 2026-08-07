@@ -32,6 +32,9 @@ ENERGY_UNIT_KCAL = "kcal/mol"
 ENERGY_UNIT_EV = "eV"
 ENERGY_UNITS = [ENERGY_UNIT_KCAL, ENERGY_UNIT_EV]
 SUPPORTED_DATA_SUFFIXES = (".parquet", ".json")
+REACTION_TABLE_MARKERS = frozenset(
+    {"ligand_pair", "reactant_geometry", "product_geometry"}
+)
 OPTIMIZED_STRUCTURE_PARQUET_MARKERS = frozenset(
     {"structure_id", "geometry", "energy_eV"}
 )
@@ -640,6 +643,9 @@ class DataManager:
             st.warning(f"Unable to inspect Parquet file {parquet_path}: {e}")
             return parquet_path
 
+        if is_raw_reaction_table_schema(column_names):
+            return self.prepare_reaction_parquet_file(parquet_path)
+
         if not is_optimized_structure_parquet_schema(column_names):
             return parquet_path
 
@@ -669,6 +675,33 @@ class DataManager:
             return normalized_path
         except Exception as e:
             st.warning(f"Unable to adapt Parquet file {parquet_path}: {e}")
+            return parquet_path
+
+    def prepare_reaction_parquet_file(self, parquet_path: Path) -> Path:
+        """Expand raw reaction-level Parquet rows into dashboard molecule rows."""
+        try:
+            parquet_df = pd.read_parquet(parquet_path)
+            parquet_df = expand_reaction_json_dataframe(parquet_df, data_source="parquet")
+            if parquet_df.empty:
+                st.warning(f"No rows found in Parquet file: {parquet_path}")
+                return parquet_path
+
+            file_stamp = ""
+            try:
+                stat = parquet_path.stat()
+                file_stamp = f":{stat.st_mtime_ns}:{stat.st_size}"
+            except OSError:
+                pass
+            digest = hashlib.md5(
+                f"{parquet_path.resolve()}{file_stamp}:reaction-table".encode()
+            ).hexdigest()[:10]
+            normalized_path = (
+                self.temp_dir / f"{parquet_path.stem}_iqc_dashboard_{digest}.parquet"
+            )
+            parquet_df.to_parquet(normalized_path, index=False)
+            return normalized_path
+        except Exception as e:
+            st.warning(f"Unable to adapt reaction Parquet file {parquet_path}: {e}")
             return parquet_path
 
     def convert_json_to_parquet(self, json_path: Path) -> Optional[Path]:
@@ -1258,6 +1291,12 @@ def is_optimized_structure_parquet_schema(column_names: Tuple[str, ...]) -> bool
     return OPTIMIZED_STRUCTURE_PARQUET_MARKERS.issubset(set(column_names))
 
 
+def is_raw_reaction_table_schema(column_names: Tuple[str, ...]) -> bool:
+    """Return True for raw reaction tables with paired reactant/product geometries."""
+    columns = set(column_names)
+    return REACTION_TABLE_MARKERS.issubset(columns) and "reaction_role" not in columns
+
+
 def optimized_structure_parquet_needs_aliases(column_names: Tuple[str, ...]) -> bool:
     """Return True when a recognized optimized-structure export lacks aliases."""
     columns = set(column_names)
@@ -1311,19 +1350,14 @@ def normalize_json_dataframe(json_df: pd.DataFrame) -> pd.DataFrame:
         return json_df
 
     if is_reaction_json_dataframe(json_df):
-        return expand_reaction_json_dataframe(json_df)
+        return expand_reaction_json_dataframe(json_df, data_source="json")
 
     return json_df.reset_index(drop=True)
 
 
 def is_reaction_json_dataframe(df: pd.DataFrame) -> bool:
     """Return True for reaction-level JSON containing paired geometries."""
-    required_columns = {
-        "ligand_pair",
-        "reactant_geometry",
-        "product_geometry",
-    }
-    return required_columns.issubset(df.columns)
+    return is_raw_reaction_table_schema(tuple(df.columns))
 
 
 def sanitize_name_part(value: Any) -> str:
@@ -1404,7 +1438,12 @@ def get_reaction_json_smiles(row: pd.Series, role: str) -> Optional[str]:
     return None
 
 
-def build_reaction_json_component_row(row: pd.Series, role: str, row_index: Any) -> dict:
+def build_reaction_json_component_row(
+    row: pd.Series,
+    role: str,
+    row_index: Any,
+    data_source: str = "json",
+) -> dict:
     """Build one molecule-like row from a reaction-level JSON row."""
     geometry = get_optional_row_value(row, f"{role}_geometry")
     if geometry is None:
@@ -1424,6 +1463,7 @@ def build_reaction_json_component_row(row: pd.Series, role: str, row_index: Any)
             "unique_name": build_reaction_json_unique_name(row, role, row_index),
             "reaction_role": role,
             "source_json_row": row_index,
+            "reaction_table_source": data_source,
             "initial_xyz": str(geometry),
             "opt_xyz": str(geometry),
             "number_of_atoms": count_xyz_atoms(geometry),
@@ -1432,7 +1472,7 @@ def build_reaction_json_component_row(row: pd.Series, role: str, row_index: Any)
             "initial_smiles": "",
             "opt_smiles": "",
             "task": "reaction",
-            "calculator": "json",
+            "calculator": data_source,
             "opt_converged": True,
             "smiles_changed": False,
             "number_of_imaginary": 0,
@@ -1447,12 +1487,29 @@ def build_reaction_json_component_row(row: pd.Series, role: str, row_index: Any)
     return component_row
 
 
-def expand_reaction_json_dataframe(json_df: pd.DataFrame) -> pd.DataFrame:
+def expand_reaction_json_dataframe(
+    json_df: pd.DataFrame,
+    data_source: str = "json",
+) -> pd.DataFrame:
     """Expand reaction-level JSON rows into reactant/product molecule rows."""
     rows = []
     for row_index, row in json_df.reset_index(drop=True).iterrows():
-        rows.append(build_reaction_json_component_row(row, "reactant", row_index))
-        rows.append(build_reaction_json_component_row(row, "product", row_index))
+        rows.append(
+            build_reaction_json_component_row(
+                row,
+                "reactant",
+                row_index,
+                data_source=data_source,
+            )
+        )
+        rows.append(
+            build_reaction_json_component_row(
+                row,
+                "product",
+                row_index,
+                data_source=data_source,
+            )
+        )
 
     return pd.DataFrame(rows)
 
@@ -3139,17 +3196,30 @@ def extract_descriptor_keyword_options(df: pd.DataFrame, role: str) -> List[str]
 
     keywords = set()
     skipped_tokens = {"reactant", "product", "co2", "bipy", "c2h2"}
-    for unique_name in df["unique_name"].dropna().astype(str).unique():
-        parsed_name = parse_unique_name(unique_name)
+    selector_columns = ["unique_name"]
+    if "ligand_pair" in df.columns:
+        selector_columns.append("ligand_pair")
+    for _, row in (
+        df[selector_columns]
+        .dropna(subset=["unique_name"])
+        .drop_duplicates()
+        .iterrows()
+    ):
+        parsed_name = parse_reaction_row_identity(row)
         if parsed_name.get("role") != role:
             continue
 
-        for key in ("bipyridine", "alkyne"):
-            value = parsed_name.get(key)
-            if value:
-                keywords.add(str(value))
+        parsed_unique_name = parse_unique_name(str(row.get("unique_name", "")))
+        for parsed_metadata in (parsed_name, parsed_unique_name):
+            for key in ("bipyridine", "alkyne"):
+                value = parsed_metadata.get(key)
+                if value:
+                    keywords.add(str(value))
 
-        for token in re.split(r"[^A-Za-z0-9+-]+", unique_name):
+        searchable_text = " ".join(
+            str(row.get(column, "")) for column in selector_columns
+        )
+        for token in re.split(r"[^A-Za-z0-9+-]+", searchable_text):
             normalized = token.strip()
             if len(normalized) < 2 or normalized.lower() in skipped_tokens:
                 continue
@@ -3847,7 +3917,7 @@ def descriptor_name_metadata(
     reactants: pd.DataFrame,
 ) -> Tuple[Dict[Any, str], Dict[Any, str]]:
     """Return bipyridine and alkyne lookup maps keyed by source JSON row."""
-    parsed_names = reactants["unique_name"].astype(str).apply(parse_unique_name)
+    parsed_names = reactants.apply(parse_reaction_row_identity, axis=1)
     source_ids = reactants["source_json_row"]
     bipyridines = dict(
         zip(
@@ -5258,6 +5328,74 @@ def create_molecule_spectrum_plot(molecule_data, title: str) -> Optional[go.Figu
     )
 
 
+def has_renderable_xyz(xyz_string) -> bool:
+    """Return True when a value contains parseable XYZ geometry text."""
+    if is_missing_scalar(xyz_string):
+        return False
+    xyz_text = str(xyz_string)
+    if not xyz_text.strip():
+        return False
+    return parse_xyz_coordinates(xyz_text) is not None
+
+
+def is_synthetic_reaction_initial_xyz(molecule_data: pd.Series) -> bool:
+    """Return True when a reaction component only has one geometry duplicated."""
+    if is_missing_scalar(molecule_data.get("reaction_role", None)):
+        return False
+    initial_xyz = molecule_data.get("initial_xyz", None)
+    opt_xyz = molecule_data.get("opt_xyz", None)
+    if is_missing_scalar(initial_xyz) or is_missing_scalar(opt_xyz):
+        return False
+    return str(initial_xyz).strip() == str(opt_xyz).strip()
+
+
+def get_single_calculation_structure_views(molecule_data: pd.Series) -> List[dict]:
+    """Return the structure views that should be rendered for one molecule row."""
+    initial_xyz = molecule_data.get("initial_xyz", None)
+    opt_xyz = molecule_data.get("opt_xyz", None)
+
+    show_initial = has_renderable_xyz(initial_xyz) and not is_synthetic_reaction_initial_xyz(
+        molecule_data
+    )
+    show_optimized = has_renderable_xyz(opt_xyz)
+
+    views = []
+    if show_initial:
+        views.append(
+            {
+                "kind": "initial",
+                "title": "Initial Structure",
+                "label": "Initial",
+                "xyz": str(initial_xyz),
+            }
+        )
+    if show_optimized:
+        views.append(
+            {
+                "kind": "optimized",
+                "title": "Optimized Structure",
+                "label": "Optimized",
+                "xyz": str(opt_xyz),
+            }
+        )
+    return views
+
+
+def build_molecule_ir_outputs(
+    molecule_data: pd.Series,
+    title: str,
+) -> Tuple[Optional[go.Figure], pd.DataFrame]:
+    """Build available IR spectrum outputs without placeholder UI state."""
+    frequencies = _get_first_present(
+        molecule_data,
+        ("vibrational_frequencies_cm^-1", "frequencies_cm^-1"),
+    )
+    intensities = molecule_data.get("spectrum_intensities", None)
+    freq_table = build_vibrational_frequency_table(frequencies, intensities)
+    fig_vib = create_molecule_spectrum_plot(molecule_data, title)
+    return fig_vib, freq_table
+
+
 def add_atom_labels(view, xyz_string: str) -> None:
     """Add element-index labels to a py3Dmol view."""
     parsed_xyz = parse_xyz_coordinates(xyz_string)
@@ -5402,6 +5540,40 @@ def parse_unique_name(unique_name: str) -> dict:
     # the heavy work (string splitting) is memoized on the underlying tuple.
     bipyridine, alkyne, role = _parse_unique_name_cached(unique_name)
     return {"bipyridine": bipyridine, "alkyne": alkyne, "role": role}
+
+
+def parse_ligand_pair(ligand_pair: Any) -> dict:
+    """Parse ligand_pair metadata into bipyridine and alkyne labels."""
+    if is_missing_scalar(ligand_pair):
+        return {"bipyridine": None, "alkyne": None}
+
+    text = str(ligand_pair).strip()
+    if not text:
+        return {"bipyridine": None, "alkyne": None}
+
+    bipyridine_token, separator, alkyne_token = text.partition("_")
+    if not separator:
+        return {"bipyridine": None, "alkyne": None}
+
+    bipyridine = bipyridine_token.removeprefix("bipy-") or None
+    alkyne = alkyne_token or None
+    return {"bipyridine": bipyridine, "alkyne": alkyne}
+
+
+def parse_reaction_row_identity(
+    row: pd.Series,
+    unique_name_column: str = "unique_name",
+) -> dict:
+    """Parse reaction identity, preferring explicit ligand_pair metadata."""
+    parsed_name = parse_unique_name(str(row.get(unique_name_column, "")))
+    parsed_ligand_pair = parse_ligand_pair(row.get("ligand_pair", None))
+
+    return {
+        "bipyridine": parsed_ligand_pair.get("bipyridine")
+        or parsed_name.get("bipyridine"),
+        "alkyne": parsed_ligand_pair.get("alkyne") or parsed_name.get("alkyne"),
+        "role": parsed_name.get("role"),
+    }
 
 
 def calculate_reaction_gibbs(
@@ -5614,7 +5786,9 @@ def calculate_precomputed_reaction_gibbs(
         return pd.DataFrame()
 
     metadata_columns = [
-        column for column in ("stereo_type", "insertion_type") if column in work.columns
+        column
+        for column in ("ligand_pair", "stereo_type", "insertion_type")
+        if column in work.columns
     ]
     if metadata_columns:
         metadata = (
@@ -5625,7 +5799,10 @@ def calculate_precomputed_reaction_gibbs(
         )
         delta = delta.merge(metadata, on="source_json_row", how="left", sort=False)
 
-    parsed_names = delta["unique_name_reactant"].astype(str).apply(parse_unique_name)
+    parsed_names = delta.apply(
+        lambda row: parse_reaction_row_identity(row, "unique_name_reactant"),
+        axis=1,
+    )
     parsed_df = pd.DataFrame(parsed_names.tolist(), index=delta.index)
 
     if energy_unit == ENERGY_UNIT_EV:
@@ -5645,6 +5822,9 @@ def calculate_precomputed_reaction_gibbs(
             "unique_name_reactant": delta["unique_name_reactant"],
             "unique_name_product": delta["unique_name_product"],
             "source_json_row": delta["source_json_row"],
+            "ligand_pair": (
+                delta["ligand_pair"] if "ligand_pair" in delta.columns else None
+            ),
             "stereo_type": (
                 delta["stereo_type"] if "stereo_type" in delta.columns else None
             ),
@@ -5738,8 +5918,16 @@ def build_ligand_selector_df(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty or "unique_name" not in df.columns:
         return pd.DataFrame(columns=["unique_name", "bipyridine", "alkyne", "role"])
 
-    selector_df = df[["unique_name"]].dropna().drop_duplicates().reset_index(drop=True)
-    parsed = selector_df["unique_name"].apply(parse_unique_name)
+    selector_columns = ["unique_name"]
+    if "ligand_pair" in df.columns:
+        selector_columns.append("ligand_pair")
+    selector_df = (
+        df[selector_columns]
+        .dropna(subset=["unique_name"])
+        .drop_duplicates()
+        .reset_index(drop=True)
+    )
+    parsed = selector_df.apply(parse_reaction_row_identity, axis=1)
     parsed_df = pd.DataFrame(parsed.tolist())
 
     selector_df = pd.concat([selector_df, parsed_df], axis=1)
@@ -5747,7 +5935,7 @@ def build_ligand_selector_df(df: pd.DataFrame) -> pd.DataFrame:
         subset=["bipyridine", "alkyne", "role"]
     ).reset_index(drop=True)
 
-    return selector_df
+    return selector_df[["unique_name", "bipyridine", "alkyne", "role"]]
 
 
 # ============================================================================
@@ -5759,6 +5947,19 @@ def main(data_paths: Optional[List[str]] = None):
     st.set_page_config(page_title="IQC Dashboard", page_icon="⚛️", layout="wide")
 
     st.title("⚛️ IQC Dashboard")
+    st.markdown(
+        """
+        <style>
+        .stButton button[data-testid="baseButton-primary"],
+        .stButton button[kind="primary"] {
+            min-height: 3rem;
+            font-size: 1.05rem;
+            font-weight: 700;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
 
     energy_unit = st.radio(
         "Energy units",
@@ -6137,13 +6338,33 @@ def main(data_paths: Optional[List[str]] = None):
                     st.metric("Status", status)
 
                 # Row 2: Energy values
-                col3, col4 = st.columns(2)
-                with col3:
-                    initial_energy = molecule_data.get("initial_energy_eV", None)
-                    st.metric("Initial Energy", format_energy_value(initial_energy, energy_unit))
-                with col4:
-                    energy = molecule_data.get("opt_energy_eV", None)
-                    st.metric("Optimized Energy", format_energy_value(energy, energy_unit))
+                energy_metrics = []
+                initial_energy = molecule_data.get("initial_energy_eV", None)
+                if not is_missing_scalar(initial_energy):
+                    energy_metrics.append(
+                        (
+                            "Initial Energy",
+                            format_energy_value(initial_energy, energy_unit),
+                        )
+                    )
+                energy = molecule_data.get("opt_energy_eV", None)
+                if not is_missing_scalar(energy):
+                    energy_metrics.append(
+                        (
+                            "Optimized Energy",
+                            format_energy_value(energy, energy_unit),
+                        )
+                    )
+
+                if energy_metrics:
+                    energy_columns = st.columns(len(energy_metrics))
+                    for energy_column, (energy_label, energy_text) in zip(
+                        energy_columns,
+                        energy_metrics,
+                        strict=True,
+                    ):
+                        with energy_column:
+                            st.metric(energy_label, energy_text)
 
                 # Row 3: Connectivity Info (SMILES strings)
                 st.markdown("---")
@@ -6208,147 +6429,14 @@ def main(data_paths: Optional[List[str]] = None):
                         else:
                             st.write("N/A")
 
-                st.markdown("---")
+                def _render_single_calc_navigation():
+                    if not single_calc_molecule_names:
+                        return
 
-                # 3D Visualization
-                st.subheader("3D Molecular Structures")
-
-                view_style_options = {
-                    "Stick": "stick",
-                    "Ball and stick": "ball_and_stick",
-                    "Sphere": "sphere",
-                    "Wireframe": "wireframe",
-                }
-                col_view_style, col_view_labels = st.columns([2, 1])
-                with col_view_style:
-                    selected_view_style = st.selectbox(
-                        "3D style",
-                        options=list(view_style_options.keys()),
-                        key="molecule_view_style",
-                    )
-                with col_view_labels:
-                    show_atom_labels = st.checkbox(
-                        "Atom labels",
-                        value=False,
-                        key="molecule_view_labels",
-                    )
-                molecule_view_style = view_style_options[selected_view_style]
-
-                col_left, col_right = st.columns(2)
-
-                with col_left:
-                    st.markdown("### Initial Structure")
-                    initial_xyz = molecule_data.get("initial_xyz", None)
-                    render_molecule(
-                        initial_xyz,
-                        style=molecule_view_style,
-                        label="Initial",
-                        show_labels=show_atom_labels,
-                    )
-
-                with col_right:
-                    st.markdown("### Optimized Structure")
-                    opt_xyz = molecule_data.get("opt_xyz", None)
-                    render_molecule(
-                        opt_xyz,
-                        style=molecule_view_style,
-                        label="Optimized",
-                        show_labels=show_atom_labels,
-                    )
-
-                st.markdown("---")
-
-                st.subheader("Geometry Optimization Summary")
-                geometry_summary = build_geometry_optimization_summary(
-                    molecule_data,
-                    energy_unit,
-                )
-                if geometry_summary is None:
-                    st.info(
-                        "Geometry optimization summary requires matching initial_xyz "
-                        "and opt_xyz atom lists."
-                    )
-                else:
-                    col_geom1, col_geom2, col_geom3 = st.columns(3)
-                    with col_geom1:
-                        energy_change = geometry_summary["energy_change"]
-                        energy_change_text = (
-                            f"{energy_change:.4f} {energy_unit}"
-                            if energy_change is not None
-                            else "N/A"
-                        )
-                        st.metric("Energy Change", energy_change_text)
-                    with col_geom2:
-                        st.metric(
-                            "Heavy-atom RMSD",
-                            f"{geometry_summary['heavy_atom_rmsd']:.3f} Å",
-                        )
-                    with col_geom3:
-                        st.metric(
-                            "Max Atom Displacement",
-                            f"{geometry_summary['max_atom_displacement']:.3f} Å",
-                        )
-
-                    for label, table_key in [
-                        ("Largest Bond Changes", "bond_changes"),
-                        ("Largest Angle Changes", "angle_changes"),
-                        ("Largest Dihedral Changes", "dihedral_changes"),
-                    ]:
-                        st.markdown(f"**{label}**")
-                        change_df = geometry_summary[table_key]
-                        if change_df.empty:
-                            st.info("No bonded geometry changes available.")
-                        else:
-                            st.dataframe(
-                                change_df,
-                                width="stretch",
-                                hide_index=True,
-                            )
-
-                st.markdown("---")
-
-                # IR spectrum and vibrational frequency analysis for the selected calculation
-                st.subheader("IR Spectrum")
-
-                frequencies = _get_first_present(
-                    molecule_data,
-                    ("vibrational_frequencies_cm^-1", "frequencies_cm^-1"),
-                )
-                intensities = molecule_data.get("spectrum_intensities", None)
-                freq_table = build_vibrational_frequency_table(frequencies, intensities)
-                fig_vib = create_molecule_spectrum_plot(
-                    molecule_data,
-                    f"IR Spectrum for {displayed_molecule}",
-                )
-
-                if fig_vib is not None or not freq_table.empty:
-                    col_vib1, col_vib2 = st.columns([3, 2])
-
-                    with col_vib1:
-                        if fig_vib is not None:
-                            st.plotly_chart(fig_vib, width="stretch")
-                        else:
-                            st.info("No IR spectrum data available for this calculation.")
-
-                    with col_vib2:
-                        if not freq_table.empty:
-                            st.dataframe(
-                                freq_table,
-                                width="stretch",
-                                hide_index=True,
-                            )
-                        else:
-                            st.info("No vibrational mode table available for this calculation.")
-                else:
-                    st.info(
-                        "No IR spectrum or vibrational frequency data available "
-                        "for this calculation."
-                    )
-
-                # Navigation controls
-                if single_calc_molecule_names:
                     if use_ligand_selector_navigation:
-                        current_index = single_calc_molecule_names.index(displayed_molecule)
+                        current_index = single_calc_molecule_names.index(
+                            displayed_molecule
+                        )
 
                         def _go_prev():
                             move_indexed_selection(
@@ -6386,13 +6474,16 @@ def main(data_paths: Optional[List[str]] = None):
                                 "selected_molecule_index",
                             )
 
-                    nav_col_left, nav_col_center, nav_col_right = st.columns([1, 2, 1])
+                    nav_col_left, nav_col_center, nav_col_right = st.columns(
+                        [1.35, 0.7, 1.35]
+                    )
                     with nav_col_left:
                         if st.button(
-                            "⬅️ Previous",
+                            "⬅️ Previous molecule",
                             width="stretch",
                             disabled=current_index == 0,
                             on_click=_go_prev,
+                            key="single_calc_prev_button",
                         ):
                             st.rerun()
                     with nav_col_center:
@@ -6401,12 +6492,139 @@ def main(data_paths: Optional[List[str]] = None):
                         )
                     with nav_col_right:
                         if st.button(
-                            "Next ➡️",
+                            "Next molecule ➡️",
                             width="stretch",
                             disabled=current_index == len(single_calc_molecule_names) - 1,
                             on_click=_go_next,
+                            key="single_calc_next_button",
+                            type="primary",
                         ):
                             st.rerun()
+
+                structure_views = get_single_calculation_structure_views(molecule_data)
+                if structure_views:
+                    st.markdown("---")
+
+                    # 3D Visualization
+                    st.subheader("3D Molecular Structures")
+
+                    view_style_options = {
+                        "Stick": "stick",
+                        "Ball and stick": "ball_and_stick",
+                        "Sphere": "sphere",
+                        "Wireframe": "wireframe",
+                    }
+                    col_view_style, col_view_labels = st.columns([2, 1])
+                    with col_view_style:
+                        selected_view_style = st.selectbox(
+                            "3D style",
+                            options=list(view_style_options.keys()),
+                            key="molecule_view_style",
+                        )
+                    with col_view_labels:
+                        show_atom_labels = st.checkbox(
+                            "Atom labels",
+                            value=False,
+                            key="molecule_view_labels",
+                        )
+                    molecule_view_style = view_style_options[selected_view_style]
+
+                    structure_columns = st.columns(len(structure_views))
+                    for structure_column, structure_view in zip(
+                        structure_columns,
+                        structure_views,
+                        strict=True,
+                    ):
+                        with structure_column:
+                            st.markdown(f"### {structure_view['title']}")
+                            render_molecule(
+                                structure_view["xyz"],
+                                style=molecule_view_style,
+                                label=structure_view["label"],
+                                show_labels=show_atom_labels,
+                            )
+
+                    _render_single_calc_navigation()
+
+                elif single_calc_molecule_names:
+                    st.markdown("---")
+                    _render_single_calc_navigation()
+
+                structure_view_kinds = {
+                    structure_view["kind"] for structure_view in structure_views
+                }
+                if {"initial", "optimized"}.issubset(structure_view_kinds):
+                    geometry_summary = build_geometry_optimization_summary(
+                        molecule_data,
+                        energy_unit,
+                    )
+                    if geometry_summary is not None:
+                        st.markdown("---")
+                        st.subheader("Geometry Optimization Summary")
+
+                        col_geom1, col_geom2, col_geom3 = st.columns(3)
+                        with col_geom1:
+                            energy_change = geometry_summary["energy_change"]
+                            energy_change_text = (
+                                f"{energy_change:.4f} {energy_unit}"
+                                if energy_change is not None
+                                else "N/A"
+                            )
+                            st.metric("Energy Change", energy_change_text)
+                        with col_geom2:
+                            st.metric(
+                                "Heavy-atom RMSD",
+                                f"{geometry_summary['heavy_atom_rmsd']:.3f} Å",
+                            )
+                        with col_geom3:
+                            st.metric(
+                                "Max Atom Displacement",
+                                f"{geometry_summary['max_atom_displacement']:.3f} Å",
+                            )
+
+                        for label, table_key in [
+                            ("Largest Bond Changes", "bond_changes"),
+                            ("Largest Angle Changes", "angle_changes"),
+                            ("Largest Dihedral Changes", "dihedral_changes"),
+                        ]:
+                            change_df = geometry_summary[table_key]
+                            if not change_df.empty:
+                                st.markdown(f"**{label}**")
+                                st.dataframe(
+                                    change_df,
+                                    width="stretch",
+                                    hide_index=True,
+                                )
+
+                # IR spectrum and vibrational frequency analysis for the selected calculation
+                fig_vib, freq_table = build_molecule_ir_outputs(
+                    molecule_data,
+                    f"IR Spectrum for {displayed_molecule}",
+                )
+                if fig_vib is not None or not freq_table.empty:
+                    st.markdown("---")
+                    st.subheader("IR Spectrum")
+
+                    if fig_vib is not None and not freq_table.empty:
+                        col_vib1, col_vib2 = st.columns([3, 2])
+
+                        with col_vib1:
+                            st.plotly_chart(fig_vib, width="stretch")
+
+                        with col_vib2:
+                            st.dataframe(
+                                freq_table,
+                                width="stretch",
+                                hide_index=True,
+                            )
+                    elif fig_vib is not None:
+                        st.plotly_chart(fig_vib, width="stretch")
+                    else:
+                        st.dataframe(
+                            freq_table,
+                            width="stretch",
+                            hide_index=True,
+                        )
 
                 st.markdown("---")
 
@@ -7412,8 +7630,8 @@ def main(data_paths: Optional[List[str]] = None):
                 st.warning("No complete reactions found.")
                 st.info(
                     "For IQC thermo datasets, ensure entries include reactant, product, "
-                    "and CO2 rows with G_eV. For reaction JSON, ensure paired reactant "
-                    "and product rows include reaction_gibbs_kcal."
+                    "and CO2 rows with G_eV. For reaction table data, ensure paired "
+                    "reactant and product rows include reaction_gibbs_kcal."
                 )
             else:
                 # Create the delta G heatmap
@@ -7597,7 +7815,7 @@ def main(data_paths: Optional[List[str]] = None):
                                     rxn.get("reaction_gibbs_kcal"),
                                 ),
                             )
-                            st.write("CO2 term is not present in reaction JSON.")
+                            st.write("CO2 term is not present in reaction table data.")
                         else:
                             st.metric(
                                 f"G_CO2 ({energy_unit})",
@@ -7746,7 +7964,7 @@ def main(data_paths: Optional[List[str]] = None):
             st.error(f"Error processing reactions: {ve}")
             st.info(
                 "Please ensure the dataset contains either IQC CO2/reactant/product "
-                "entries with G_eV, or reaction JSON rows with reaction_gibbs_kcal."
+                "entries with G_eV, or reaction table rows with reaction_gibbs_kcal."
             )
         except Exception as e:
             st.error(f"Unexpected error in reactions analysis: {e}")

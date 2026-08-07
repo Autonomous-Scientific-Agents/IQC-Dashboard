@@ -133,6 +133,59 @@ class TestDataManager:
         assert not descriptor_df.empty
         assert set(descriptor_df["role"]) == {"reactant", "product"}
 
+    def test_load_data_paths_expands_reaction_parquet(self, temp_dir):
+        """Test raw reaction-level Parquet expands into dashboard molecule rows."""
+        reactant_xyz = "2\n\nNi 0.0 0.0 0.0\nN 1.8 0.0 0.0\n"
+        product_xyz = "3\n\nNi 0.0 0.0 0.0\nN 1.8 0.0 0.0\nC 2.8 0.0 0.0\n"
+        parquet_path = Path(temp_dir) / "reaction_data.parquet"
+        pd.DataFrame(
+            {
+                "ligand_pair": ["bipy-daaaaaaa_a-C2H2-p"],
+                "stereo_type": ["S"],
+                "insertion_type": ["Type_I"],
+                "reaction_gibbs_kcal": [16.5],
+                "reactant_gibbs": [-273.0],
+                "product_gibbs": [-295.5],
+                "reactant_geometry": [reactant_xyz],
+                "product_geometry": [product_xyz],
+                "reactant_configuration": ["intermediate"],
+                "product_configuration": ["intermediate"],
+            }
+        ).to_parquet(parquet_path, index=False)
+
+        dm = DataManager(temp_dir)
+        loaded_paths = dm.load_data_paths([str(parquet_path)])
+
+        assert len(loaded_paths) == 1
+        assert loaded_paths[0] != str(parquet_path)
+        loaded_df = pd.read_parquet(loaded_paths[0])
+        assert loaded_df["reaction_role"].tolist() == ["reactant", "product"]
+        assert loaded_df["reaction_table_source"].tolist() == ["parquet", "parquet"]
+        assert loaded_df["calculator"].tolist() == ["parquet", "parquet"]
+        assert loaded_df["source_json_row"].tolist() == [0, 0]
+        assert loaded_df["opt_xyz"].tolist() == [reactant_xyz, product_xyz]
+        assert loaded_df["number_of_atoms"].tolist() == [2, 3]
+        assert loaded_df["source_gibbs"].tolist() == [-273.0, -295.5]
+        assert loaded_df["unique_name"].tolist() == [
+            "bipy-daaaaaaa_a-C2H2-p_reactant_intermediate_S_Type_I_0",
+            "bipy-daaaaaaa_a-C2H2-p_product_intermediate_S_Type_I_0",
+        ]
+
+        parquet_hash = dm._get_parquet_files_hash()
+        assert dm.get_all_molecule_names(parquet_hash) == sorted(
+            loaded_df["unique_name"].tolist()
+        )
+        reaction_table = calculate_reaction_table(
+            loaded_df,
+            energy_unit=ENERGY_UNIT_KCAL,
+        )
+        assert reaction_table["deltaG"].tolist() == [pytest.approx(16.5)]
+        assert reaction_table["bipyridine"].tolist() == ["daaaaaaa"]
+        assert reaction_table["alkyne"].tolist() == ["a-C2H2-p"]
+        selector_df = build_ligand_selector_df(loaded_df)
+        assert selector_df["bipyridine"].unique().tolist() == ["daaaaaaa"]
+        assert selector_df["alkyne"].unique().tolist() == ["a-C2H2-p"]
+
     def test_load_data_paths_leaves_iqc_parquet_unchanged(self, temp_dir, sample_parquet_file):
         """Test IQC-schema Parquet files are not copied or modified."""
         dm = DataManager(temp_dir)

@@ -11,11 +11,14 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from iqc_dashboard.app import (
     ENERGY_UNIT_EV,
+    build_molecule_ir_outputs,
     build_geometry_optimization_summary,
     build_vibrational_frequency_table,
     create_ir_spectrum_plot,
     create_molecule_spectrum_plot,
     create_vibrational_stick_plot,
+    get_single_calculation_structure_views,
+    has_renderable_xyz,
     normalize_spectrum_intensities,
     normalize_vibrational_frequencies,
     parse_xyz_coordinates,
@@ -196,6 +199,40 @@ class TestRenderMolecule:
 
         assert summary is None
 
+    def test_single_calculation_structure_views_hide_missing_initial(self):
+        """Test structure layout omits unavailable initial geometry."""
+        molecule_data = pd.Series(
+            {
+                "opt_xyz": "2\noptimized\nNi 0.0 0.0 0.0\nN 1.8 0.0 0.0\n",
+            }
+        )
+
+        views = get_single_calculation_structure_views(molecule_data)
+
+        assert [view["kind"] for view in views] == ["optimized"]
+
+    def test_single_calculation_structure_views_hide_synthetic_reaction_initial(self):
+        """Test reaction rows do not show duplicated initial/optimized geometry."""
+        xyz = "2\nreaction\nNi 0.0 0.0 0.0\nN 1.8 0.0 0.0\n"
+        molecule_data = pd.Series(
+            {
+                "reaction_role": "reactant",
+                "initial_xyz": xyz,
+                "opt_xyz": xyz,
+            }
+        )
+
+        views = get_single_calculation_structure_views(molecule_data)
+
+        assert [view["kind"] for view in views] == ["optimized"]
+
+    def test_has_renderable_xyz_rejects_missing_or_invalid_values(self):
+        """Test renderable XYZ detection rejects missing and malformed values."""
+        assert not has_renderable_xyz(pd.NA)
+        assert not has_renderable_xyz("")
+        assert not has_renderable_xyz("not xyz")
+        assert has_renderable_xyz("1\n\nNi 0.0 0.0 0.0\n")
+
     def test_normalize_vibrational_frequencies(self):
         """Test vibrational frequency normalization handles iterable numeric input."""
         result = normalize_vibrational_frequencies([100, -25.5, 300])
@@ -295,6 +332,13 @@ class TestRenderMolecule:
         assert list(fig.data[0].x) == [100.0, 200.0, 300.0]
         assert list(fig.data[0].y) == [0.0, 4.5, 1.2]
         assert fig.layout.yaxis.title.text == "IR Intensity (km/mol)"
+
+    def test_build_molecule_ir_outputs_returns_empty_when_ir_absent(self):
+        """Test IR layout data is empty when no spectrum or frequencies exist."""
+        fig, table = build_molecule_ir_outputs(pd.Series({"unique_name": "mol"}), "IR")
+
+        assert fig is None
+        assert table.empty
 
     def test_create_vibrational_stick_plot_with_invalid_input(self):
         """Test vibrational stick plot returns None for invalid input."""
