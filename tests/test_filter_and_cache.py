@@ -14,6 +14,7 @@ from iqc_dashboard.app import (
     build_filter_fingerprint,
     build_selected_descriptor_dataframe,
     build_text_filter_sql,
+    build_upload_signature,
     convert_descriptor_records_energy_unit,
     descriptor_delta_record_columns,
     fingerprinted_reaction_table,
@@ -186,6 +187,38 @@ class TestSessionFilteredDataCache:
             build_filter_fingerprint("hash-a", dict(NO_FILTERS, formula="H2O"))
             != base
         )
+
+
+class _FakeUpload:
+    def __init__(self, name, size, file_id=None):
+        self.name = name
+        self.size = size
+        if file_id is not None:
+            self.file_id = file_id
+
+
+class TestBuildUploadSignature:
+    def test_same_name_and_size_but_new_upload_differs(self):
+        # A re-uploaded file gets a new file_id even when name+size collide
+        # (e.g. a same-length numeric edit in a JSON file); the signature must
+        # change so the file is re-processed.
+        first = build_upload_signature([_FakeUpload("d.json", 100, "id-1")])
+        second = build_upload_signature([_FakeUpload("d.json", 100, "id-2")])
+        assert first != second
+
+    def test_order_independent(self):
+        a = _FakeUpload("a.parquet", 1, "id-a")
+        b = _FakeUpload("b.parquet", 2, "id-b")
+        assert build_upload_signature([a, b]) == build_upload_signature([b, a])
+
+    def test_fallback_without_file_id(self):
+        first = build_upload_signature([_FakeUpload("d.json", 100)])
+        second = build_upload_signature([_FakeUpload("d.json", 100)])
+        assert first == second
+        assert first != build_upload_signature([_FakeUpload("d.json", 101)])
+
+    def test_none_entries_are_skipped(self):
+        assert build_upload_signature([None]) == ()
 
 
 class TestFingerprintedReactionTable:

@@ -1255,6 +1255,29 @@ class DataManager:
             return pd.DataFrame()
 
 
+def build_upload_signature(uploaded_files: List) -> Tuple:
+    """Identify an uploaded-file set for dedup across reruns.
+
+    Prefer Streamlit's per-upload ``file_id``, which changes when a file is
+    re-uploaded even if its name and size match — a same-size content edit
+    must not be silently ignored. Fall back to (name, size) when ``file_id``
+    is unavailable.
+    """
+    parts = []
+    for uploaded_file in uploaded_files:
+        if uploaded_file is None:
+            continue
+        file_id = getattr(uploaded_file, "file_id", None)
+        parts.append(
+            (
+                str(getattr(uploaded_file, "name", "")),
+                getattr(uploaded_file, "size", None),
+                str(file_id) if file_id is not None else None,
+            )
+        )
+    return tuple(sorted(parts, key=repr))
+
+
 FILTERED_DATA_CACHE_KEY = "_filtered_data_cache"
 
 
@@ -6187,13 +6210,7 @@ def main(data_paths: Optional[List[str]] = None):
         if uploaded_files:
             # The uploader returns its files on every rerun; only re-save and
             # re-convert them when the uploaded set actually changes.
-            upload_signature = tuple(
-                sorted(
-                    (uploaded_file.name, getattr(uploaded_file, "size", None))
-                    for uploaded_file in uploaded_files
-                    if uploaded_file is not None
-                )
-            )
+            upload_signature = build_upload_signature(uploaded_files)
             if st.session_state.get("upload_signature") != upload_signature:
                 with st.spinner("Processing uploaded files..."):
                     saved_paths = data_manager.save_uploaded_files(uploaded_files)
