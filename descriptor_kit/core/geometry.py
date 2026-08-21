@@ -19,6 +19,13 @@ def parse_xyz(block):
         p = line.split()
         els.append(p[0])
         xs.append([float(p[1]), float(p[2]), float(p[3])])
+    if len(els) != n:
+        # A truncated block would otherwise yield a partial molecule and
+        # finite-but-wrong descriptors with no diagnostic. Raising here routes
+        # the row through the callers' existing failure accounting instead.
+        raise ValueError(
+            f"XYZ block declares {n} atoms but contains {len(els)} atom lines"
+        )
     return els, np.asarray(xs, float)
 
 

@@ -1,5 +1,12 @@
 # Hammett ortho position bug (position 6 mislabeled as para)
 
+> **Status: FIXED** — Option A below is implemented in
+> `descriptor_kit/core/hammett.py` (position 6 now returns NaN), with a
+> regression test in `tests/test_hammett_ortho.py`. Precomputed parquet files
+> that contain position-6 (ortho) substituents should be regenerated; their
+> `reac_sigma_ortho_*` columns (and any sum that folded ortho in, e.g.
+> `reac_sum_sigma_bpy`) carried para constants.
+
 ## Location
 `descriptor_kit/core/hammett.py:133`
 

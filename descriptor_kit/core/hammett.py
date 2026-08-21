@@ -10,8 +10,10 @@ literature table in ``sigma_data.py``.
   ``frag`` (which must contain ``root``), capping the broken root->parent bond
   with an explicit H.  Metal-free by construction.
 * ``sigma_for_fragment(geom, root, frag, position)``:
-    - ``position`` in {4, 6} -> aromatic para / ortho proxy -> ``sigma_p``
+    - ``position`` == 4      -> aromatic para -> ``sigma_p``
     - ``position`` in {3, 5} -> aromatic meta -> ``sigma_m``
+    - ``position`` == 6      -> ortho -> NaN (no curated ``sigma_o`` table;
+                                              ``sigma_p`` is NOT a valid proxy)
     - ``position`` is None   -> alkyne group  -> ``sigma_p`` if tabulated
                                                   (group constant), else Taft
                                                   ``sigma_star``.
@@ -102,10 +104,11 @@ def sigma_for_fragment(geom, root_idx, frag_atoms, position):
     Returns
     -------
     float
-        ``sigma_p`` for positions 4/6, ``sigma_m`` for positions 3/5, the group
+        ``sigma_p`` for position 4, ``sigma_m`` for positions 3/5, the group
         constant (or Taft ``sigma_star`` fallback) for ``position is None``;
-        ``float('nan')`` if the fragment / value is untabulated or the position
-        is skipped (1/2).
+        ``float('nan')`` if the fragment / value is untabulated, the position
+        is skipped (1/2), or the position is ortho (6) — the table has no
+        curated ``sigma_o`` values and para constants are not a substitute.
     """
     smiles = fragment_smiles(geom, root_idx, frag_atoms)
     entry = sigma_data.SIGMA_TABLE.get(smiles)
@@ -130,12 +133,18 @@ def sigma_for_fragment(geom, root_idx, frag_atoms, position):
             return float(val)
         return float("nan")
 
-    if position in (4, 6):
+    if position == 4:
         val = entry.get("sigma_p")
     elif position in (3, 5):
         val = entry.get("sigma_m")
+    elif position == 6:
+        # Ortho: the table has no curated sigma_o values. Returning sigma_p
+        # here (as this branch previously did) silently assigned every ortho
+        # substituent the wrong electronic parameter; NaN lets downstream
+        # sums/means surface the missing value instead. See ortho_bug.md.
+        return float("nan")
     else:
-        # positions 1 (N), 2 (bridgehead C), 6 (ortho, skipped per spec)
+        # positions 1 (N), 2 (bridgehead C): skipped per spec
         return float("nan")
     if val is None or _isnan(val):
         return float("nan")
