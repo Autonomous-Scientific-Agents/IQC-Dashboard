@@ -1298,6 +1298,100 @@ def load_session_filtered_data(
     return df, fingerprint
 
 
+def render_categorical_filter(
+    label: str,
+    column: str,
+    widget_key: str,
+    state_key: str,
+    data_manager: DataManager,
+    parquet_files_hash: str,
+    available_columns: Optional[set],
+) -> Optional[str]:
+    """Render an All/value selectbox filter for one column when it is useful.
+
+    The filter is hidden when the column is absent from the loaded schema or
+    has fewer than two distinct values, so datasets only surface the filters
+    that can actually narrow them.
+    """
+    if available_columns is not None and column not in available_columns:
+        st.session_state[state_key] = None
+        return None
+
+    values = data_manager.get_unique_values(column, parquet_files_hash)
+    values = [value for value in values if str(value).strip() != ""]
+    if len(values) < 2:
+        st.session_state[state_key] = None
+        return None
+
+    # Drop a stored selection that no longer exists (e.g. new files loaded).
+    if st.session_state.get(widget_key) not in [None, *values]:
+        st.session_state.pop(widget_key, None)
+
+    selected = st.selectbox(
+        label,
+        options=[None] + values,
+        format_func=lambda value: "All" if value is None else str(value),
+        key=widget_key,
+    )
+    st.session_state[state_key] = selected
+    return selected
+
+
+def stringify_preview_value(value: Any, max_length: int = 300) -> Any:
+    """Make one cell safe and compact for a preview table."""
+    if isinstance(value, np.ndarray):
+        text = str(value.tolist())
+    elif isinstance(value, (list, tuple, dict)):
+        text = str(value)
+    elif isinstance(value, str):
+        text = value
+    else:
+        return value
+    if len(text) > max_length:
+        return text[: max_length - 1] + "…"
+    return text
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def fingerprinted_explorer_preview(
+    data_fingerprint: str,
+    _df: pd.DataFrame,
+    columns: Tuple[str, ...],
+    limit: int,
+) -> pd.DataFrame:
+    """Build a display-safe preview of selected columns, cached by fingerprint."""
+    preview = _df[list(columns)].head(limit).copy()
+    for column in preview.columns:
+        if preview[column].dtype == object:
+            preview[column] = preview[column].map(stringify_preview_value)
+    return preview
+
+
+def scalar_export_columns(df: pd.DataFrame) -> List[str]:
+    """Columns that export cleanly to CSV (no geometry text or array cells)."""
+    excluded = {"initial_xyz", "opt_xyz"}
+    columns = []
+    for column in df.columns:
+        if column in excluded:
+            continue
+        series = df[column]
+        if series.dtype != object:
+            columns.append(column)
+            continue
+        non_null = series.dropna()
+        sample = non_null.iloc[0] if not non_null.empty else None
+        if isinstance(sample, (list, tuple, dict, np.ndarray)):
+            continue
+        columns.append(column)
+    return columns
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def fingerprinted_csv_bytes(cache_key: Tuple, _df: pd.DataFrame) -> bytes:
+    """Encode a dataframe as CSV bytes, cached by its selection cache key."""
+    return _df.to_csv(index=False).encode("utf-8")
+
+
 # ============================================================================
 # Data Normalization Helper Functions
 # ============================================================================
@@ -6218,19 +6312,22 @@ def main(data_paths: Optional[List[str]] = None):
             st.header("🔍 Filters")
 
             # Initialize filter state if not exists
-            if "filter_formula" not in st.session_state:
-                st.session_state.filter_formula = None
-            if "filter_converged" not in st.session_state:
-                st.session_state.filter_converged = None
-            if "filter_smiles_changed" not in st.session_state:
-                st.session_state.filter_smiles_changed = None
-            if "filter_max_imag" not in st.session_state:
-                st.session_state.filter_max_imag = None
-            if "filter_text" not in st.session_state:
-                st.session_state.filter_text = ""
+            for state_key, default_value in (
+                ("filter_calculator", None),
+                ("filter_task", None),
+                ("filter_formula", None),
+                ("filter_converged", None),
+                ("filter_smiles_changed", None),
+                ("filter_max_imag", None),
+                ("filter_text", ""),
+            ):
+                if state_key not in st.session_state:
+                    st.session_state[state_key] = default_value
 
             # Reset filters button
             if st.button("🔄 Reset All Filters", width="stretch"):
+                st.session_state.filter_calculator = None
+                st.session_state.filter_task = None
                 st.session_state.filter_formula = None
                 st.session_state.filter_converged = None
                 st.session_state.filter_smiles_changed = None
@@ -6240,6 +6337,8 @@ def main(data_paths: Optional[List[str]] = None):
                 # the mirror keys above from the widgets' retained values on rerun
                 # and the reset appears to do nothing.
                 for widget_key in (
+                    "filter_calculator_select",
+                    "filter_task_select",
                     "filter_formula_select",
                     "filter_converged_select",
                     "filter_smiles_changed_select",
@@ -6252,17 +6351,42 @@ def main(data_paths: Optional[List[str]] = None):
 
             st.markdown("---")
 
-            # Get unique values for filters
+            # Schema-guarded categorical filters: only shown when the column
+            # exists in the loaded files and has more than one distinct value.
             parquet_hash = data_manager._get_parquet_files_hash()
-            formulas = data_manager.get_unique_values("formula", parquet_hash)
+            schema_df = data_manager.get_schema(parquet_hash)
+            if not schema_df.empty and "column_name" in schema_df.columns:
+                available_filter_columns = set(schema_df["column_name"].astype(str))
+            else:
+                available_filter_columns = None
 
-            selected_formula = st.selectbox(
-                "Formula",
-                options=[None] + formulas,
-                format_func=lambda x: "All" if x is None else x,
-                key="filter_formula_select",
+            render_categorical_filter(
+                "Calculator",
+                "calculator",
+                "filter_calculator_select",
+                "filter_calculator",
+                data_manager,
+                parquet_hash,
+                available_filter_columns,
             )
-            st.session_state.filter_formula = selected_formula
+            render_categorical_filter(
+                "Task",
+                "task",
+                "filter_task_select",
+                "filter_task",
+                data_manager,
+                parquet_hash,
+                available_filter_columns,
+            )
+            render_categorical_filter(
+                "Formula",
+                "formula",
+                "filter_formula_select",
+                "filter_formula",
+                data_manager,
+                parquet_hash,
+                available_filter_columns,
+            )
 
             selected_converged = st.selectbox(
                 "Optimization Converged",
@@ -6310,14 +6434,11 @@ def main(data_paths: Optional[List[str]] = None):
             )
             st.session_state.filter_text = text_filter
 
-            st.markdown("---")
-
-            # Molecule Selector
-            st.header("🔬 Molecule Selector")
-
             # Load the filtered dataset once per filter change; every tab below
             # reuses this frame and fingerprint instead of re-querying.
             active_filters = {
+                "calculator": st.session_state.get("filter_calculator", None),
+                "task": st.session_state.get("filter_task", None),
                 "formula": st.session_state.get("filter_formula", None),
                 "opt_converged": st.session_state.get("filter_converged", None),
                 "smiles_changed": st.session_state.get("filter_smiles_changed", None),
@@ -6328,6 +6449,25 @@ def main(data_paths: Optional[List[str]] = None):
                 data_manager,
                 active_filters,
             )
+
+            file_summaries = data_manager.get_parquet_file_summaries(parquet_hash)
+            total_loaded_rows = 0
+            if not file_summaries.empty and "rows" in file_summaries.columns:
+                total_loaded_rows = int(
+                    pd.to_numeric(file_summaries["rows"], errors="coerce")
+                    .fillna(0)
+                    .sum()
+                )
+            if total_loaded_rows:
+                st.caption(
+                    f"🔎 {len(filtered_df):,} of {total_loaded_rows:,} rows match "
+                    "the filters"
+                )
+
+            st.markdown("---")
+
+            # Molecule Selector
+            st.header("🔬 Molecule Selector")
 
             if not filtered_df.empty and "unique_name" in filtered_df.columns:
                 molecule_names = sorted(filtered_df["unique_name"].unique().tolist())
@@ -6865,6 +7005,76 @@ def main(data_paths: Optional[List[str]] = None):
             else:
                 st.info("Schema information not available.")
 
+        # Browse the filtered rows directly, with display-safe cells.
+        with st.expander("🔎 Data Explorer", expanded=False):
+            if df_full.empty:
+                st.info("No rows match the current filters.")
+            else:
+                default_explorer_columns = [
+                    column
+                    for column in (
+                        "unique_name",
+                        "formula",
+                        "calculator",
+                        "task",
+                        "opt_converged",
+                        "initial_energy_eV",
+                        "opt_energy_eV",
+                        "number_of_atoms",
+                    )
+                    if column in df_full.columns
+                ]
+                # Drop stored selections that no longer exist in the data.
+                stored_explorer_columns = st.session_state.get("data_explorer_columns")
+                if stored_explorer_columns is not None:
+                    cleaned_explorer_columns = [
+                        column
+                        for column in stored_explorer_columns
+                        if column in df_full.columns
+                    ]
+                    if cleaned_explorer_columns != stored_explorer_columns:
+                        st.session_state["data_explorer_columns"] = (
+                            cleaned_explorer_columns
+                        )
+                explorer_columns = st.multiselect(
+                    "Columns",
+                    options=list(df_full.columns),
+                    default=default_explorer_columns or list(df_full.columns)[:6],
+                    key="data_explorer_columns",
+                )
+                if explorer_columns:
+                    explorer_limit = 500
+                    preview_df = fingerprinted_explorer_preview(
+                        data_fingerprint,
+                        df_full,
+                        tuple(explorer_columns),
+                        explorer_limit,
+                    )
+                    st.dataframe(preview_df, width="stretch", hide_index=True)
+                    if len(df_full) > explorer_limit:
+                        st.caption(
+                            f"Showing first {explorer_limit:,} of "
+                            f"{len(df_full):,} filtered rows."
+                        )
+
+        if not df_full.empty:
+            csv_export_columns = scalar_export_columns(df_full)
+            if csv_export_columns:
+                st.download_button(
+                    "⬇️ Download filtered data (CSV)",
+                    data=fingerprinted_csv_bytes(
+                        (data_fingerprint, "analytics"),
+                        df_full[csv_export_columns],
+                    ),
+                    file_name="iqc_filtered_data.csv",
+                    mime="text/csv",
+                    help=(
+                        "All filtered rows; geometry text and array columns "
+                        "are excluded."
+                    ),
+                    key="analytics_download_csv",
+                )
+
         st.markdown("---")
 
         # Dataset Statistics (calculated from filtered data)
@@ -7372,6 +7582,25 @@ def main(data_paths: Optional[List[str]] = None):
                                 table_display,
                                 width="stretch",
                                 hide_index=True,
+                            )
+                            st.download_button(
+                                "⬇️ Download descriptor data (CSV)",
+                                data=fingerprinted_csv_bytes(
+                                    (
+                                        data_fingerprint,
+                                        "descriptors",
+                                        selected_descriptor_id,
+                                        energy_unit,
+                                        tuple(selected_reactant_keywords),
+                                        tuple(selected_product_keywords),
+                                    ),
+                                    table_display,
+                                ),
+                                file_name=(
+                                    f"iqc_descriptor_{selected_descriptor_id}.csv"
+                                ),
+                                mime="text/csv",
+                                key="descriptor_download_csv",
                             )
 
     # ========================================================================
@@ -7881,6 +8110,17 @@ def main(data_paths: Optional[List[str]] = None):
                 with col_stat4:
                     favorable = (delta_df["deltaG"] < 0).sum()
                     st.metric("Favorable Reactions", int(favorable))
+
+                st.download_button(
+                    "⬇️ Download reaction ΔG table (CSV)",
+                    data=fingerprinted_csv_bytes(
+                        (data_fingerprint, "reactions", energy_unit),
+                        delta_df,
+                    ),
+                    file_name="iqc_reaction_deltaG.csv",
+                    mime="text/csv",
+                    key="reactions_download_csv",
+                )
 
                 st.markdown("---")
 
