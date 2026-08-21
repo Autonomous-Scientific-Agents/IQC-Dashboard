@@ -568,6 +568,56 @@ except ImportError as e:
 # DataManager Class - Efficient Parquet File Handling
 # ============================================================================
 
+TEXT_FILTER_COLUMNS = ("unique_name", "initial_smiles", "opt_smiles")
+REGEX_SPECIAL_CHARACTERS = ("^", "$", "[", "]", "(", ")", "+", "?", "{", "}", "|", ".", "\\")
+
+
+def is_simple_text_pattern(text_filter: str) -> bool:
+    """Return True when a text filter has no regex metacharacters (except *)."""
+    return not any(char in text_filter for char in REGEX_SPECIAL_CHARACTERS)
+
+
+def build_text_filter_sql(text_filter: str) -> Tuple[str, List[str]]:
+    """Build one parameterized SQL condition matching a text filter across columns."""
+    if is_simple_text_pattern(text_filter):
+        escaped = (
+            text_filter.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        )
+        clauses = [
+            f"COALESCE(CAST({column} AS VARCHAR), '') ILIKE ? ESCAPE '\\'"
+            for column in TEXT_FILTER_COLUMNS
+        ]
+        pattern = f"%{escaped}%"
+        return f"({' OR '.join(clauses)})", [pattern] * len(TEXT_FILTER_COLUMNS)
+
+    clauses = [
+        f"regexp_matches(COALESCE(CAST({column} AS VARCHAR), ''), ?, 'i')"
+        for column in TEXT_FILTER_COLUMNS
+    ]
+    return f"({' OR '.join(clauses)})", [text_filter] * len(TEXT_FILTER_COLUMNS)
+
+
+def apply_pandas_text_filter(
+    result: pd.DataFrame,
+    text_filter: str,
+) -> Optional[pd.DataFrame]:
+    """Filter rows whose searchable columns match a regex; None on a bad pattern."""
+    try:
+        pattern = re.compile(text_filter, re.IGNORECASE)
+    except re.error as re_err:
+        st.warning(f"Invalid regex pattern: {re_err}")
+        return None
+
+    mask = pd.Series(False, index=result.index)
+    for column in TEXT_FILTER_COLUMNS:
+        if column in result.columns:
+            mask |= (
+                result[column]
+                .astype(str)
+                .str.contains(pattern, na=False, regex=True)
+            )
+    return result[mask]
+
 
 class DataManager:
     """Manages data ingestion and querying using DuckDB for efficient Parquet file access."""
@@ -834,109 +884,43 @@ class DataManager:
             conditions.append("number_of_imaginary <= ?")
             params.append(number_of_imaginary_max)
 
-        where_clause = " AND ".join(conditions) if conditions else ""
         limit_clause = f"LIMIT {limit}" if limit else ""
-
         parquet_paths = "', '".join(self.parquet_files)
-        query = f"""
-        SELECT *
-        FROM read_parquet(['{parquet_paths}'])
-        {f'WHERE {where_clause}' if where_clause else ''}
-        {limit_clause}
-        """
+
+        def build_query(extra_condition: Optional[str] = None) -> str:
+            all_conditions = list(conditions)
+            if extra_condition:
+                all_conditions.append(extra_condition)
+            where_clause = (
+                f"WHERE {' AND '.join(all_conditions)}" if all_conditions else ""
+            )
+            return f"""
+            SELECT *
+            FROM read_parquet(['{parquet_paths}'])
+            {where_clause}
+            {limit_clause}
+            """
+
+        text_filter = (text_filter or "").strip()
 
         try:
-            if params:
-                result = conn.execute(query, params).df()
-            else:
-                result = conn.execute(query).df()
-
-            # Apply text filter using SQL if possible (more efficient than pandas)
-            if text_filter and text_filter.strip():
+            if text_filter:
+                text_condition, text_params = build_text_filter_sql(text_filter)
                 try:
-                    # Escape special SQL characters
-                    text_filter_escaped = text_filter.replace("'", "''").replace("\\", "\\\\")
-
-                    # Check if it's a simple pattern (no regex special chars except *)
-                    is_simple_pattern = not any(
-                        char in text_filter
-                        for char in ["^", "$", "[", "]", "(", ")", "+", "?", "{", "}", "|", "."]
-                    )
-
-                    if is_simple_pattern:
-                        # Use ILIKE for simple case-insensitive pattern matching (faster)
-                        text_conditions = []
-                        text_conditions.append(
-                            f"COALESCE(CAST(unique_name AS VARCHAR), '') ILIKE '%{text_filter_escaped}%'"
-                        )
-                        text_conditions.append(
-                            f"COALESCE(CAST(initial_smiles AS VARCHAR), '') ILIKE '%{text_filter_escaped}%'"
-                        )
-                        text_conditions.append(
-                            f"COALESCE(CAST(opt_smiles AS VARCHAR), '') ILIKE '%{text_filter_escaped}%'"
-                        )
-                    else:
-                        # Use regexp_matches for complex regex patterns
-                        text_conditions = []
-                        text_conditions.append(
-                            f"regexp_matches(COALESCE(CAST(unique_name AS VARCHAR), ''), '{text_filter_escaped}', 'i')"
-                        )
-                        text_conditions.append(
-                            f"regexp_matches(COALESCE(CAST(initial_smiles AS VARCHAR), ''), '{text_filter_escaped}', 'i')"
-                        )
-                        text_conditions.append(
-                            f"regexp_matches(COALESCE(CAST(opt_smiles AS VARCHAR), ''), '{text_filter_escaped}', 'i')"
-                        )
-
-                    text_where = " OR ".join(text_conditions)
-
-                    # Re-query with text filter in SQL (more efficient)
-                    query_with_text = f"""
-                    SELECT *
-                    FROM read_parquet(['{parquet_paths}'])
-                    {f'WHERE {where_clause}' if where_clause else ''}
-                    {f'AND ({text_where})' if where_clause else f'WHERE ({text_where})'}
-                    {limit_clause}
-                    """
-
-                    if params:
-                        result = conn.execute(query_with_text, params).df()
-                    else:
-                        result = conn.execute(query_with_text).df()
+                    result = conn.execute(
+                        build_query(text_condition),
+                        params + text_params,
+                    ).df()
                 except Exception:
-                    # Fallback to pandas filtering if SQL regex fails
-                    try:
-                        pattern = re.compile(text_filter, re.IGNORECASE)
-                        mask = pd.Series([False] * len(result))
-
-                        # Check unique_name
-                        if "unique_name" in result.columns:
-                            mask |= (
-                                result["unique_name"]
-                                .astype(str)
-                                .str.contains(pattern, na=False, regex=True)
-                            )
-
-                        # Check initial_smiles
-                        if "initial_smiles" in result.columns:
-                            mask |= (
-                                result["initial_smiles"]
-                                .astype(str)
-                                .str.contains(pattern, na=False, regex=True)
-                            )
-
-                        # Check opt_smiles
-                        if "opt_smiles" in result.columns:
-                            mask |= (
-                                result["opt_smiles"]
-                                .astype(str)
-                                .str.contains(pattern, na=False, regex=True)
-                            )
-
-                        result = result[mask]
-                    except re.error as re_err:
-                        st.warning(f"Invalid regex pattern: {re_err}")
+                    # DuckDB's regex dialect differs from Python's; fall back to
+                    # pandas filtering on the base query result.
+                    result = conn.execute(build_query(), params).df()
+                    filtered_result = apply_pandas_text_filter(result, text_filter)
+                    if filtered_result is None:
                         return pd.DataFrame()
+                    result = filtered_result
+            else:
+                result = conn.execute(build_query(), params).df()
 
             # Optimize memory usage by converting object columns to category where appropriate
             if not result.empty:
@@ -1269,6 +1253,49 @@ class DataManager:
             except Exception as e2:
                 st.warning(f"Error getting schema: {e2}")
             return pd.DataFrame()
+
+
+FILTERED_DATA_CACHE_KEY = "_filtered_data_cache"
+
+
+def build_filter_fingerprint(parquet_files_hash: str, filters: Dict[str, Any]) -> str:
+    """Return a stable fingerprint identifying the loaded files plus active filters."""
+    payload = {
+        "files": parquet_files_hash,
+        "filters": {key: filters[key] for key in sorted(filters)},
+    }
+    return json.dumps(payload, sort_keys=True, default=str)
+
+
+def load_session_filtered_data(
+    data_manager: DataManager,
+    filters: Dict[str, Any],
+    session_state=None,
+) -> Tuple[pd.DataFrame, str]:
+    """Return the filtered dataset for the active filters, cached per session.
+
+    Streamlit reruns the whole script on every widget interaction and every tab
+    body executes each time, so without caching the full dataset is re-queried
+    several times per click. A single session-state slot avoids both the repeat
+    queries and the per-call deep copies that ``st.cache_data`` would make for
+    large frames. Callers must treat the returned frame as read-only.
+    """
+    state = st.session_state if session_state is None else session_state
+    fingerprint = build_filter_fingerprint(
+        data_manager._get_parquet_files_hash(),
+        filters,
+    )
+    cached = state.get(FILTERED_DATA_CACHE_KEY)
+    if (
+        isinstance(cached, dict)
+        and cached.get("fingerprint") == fingerprint
+        and isinstance(cached.get("df"), pd.DataFrame)
+    ):
+        return cached["df"], fingerprint
+
+    df = data_manager.get_filtered_data(**filters, limit=None)
+    state[FILTERED_DATA_CACHE_KEY] = {"fingerprint": fingerprint, "df": df}
+    return df, fingerprint
 
 
 # ============================================================================
@@ -4356,8 +4383,7 @@ def build_selected_tdelta_descriptor_records(
     return records
 
 
-@st.cache_data(ttl=3600, show_spinner=False, hash_funcs=STREAMLIT_HASH_FUNCS)
-def build_selected_descriptor_dataframe(
+def _selected_descriptor_dataframe(
     df: pd.DataFrame,
     descriptor_id: str,
     energy_unit: str = ENERGY_UNIT_KCAL,
@@ -4429,6 +4455,83 @@ def build_selected_descriptor_dataframe(
         records = []
 
     return pd.DataFrame(records, columns=columns)
+
+
+@st.cache_data(ttl=3600, show_spinner=False, hash_funcs=STREAMLIT_HASH_FUNCS)
+def build_selected_descriptor_dataframe(
+    df: pd.DataFrame,
+    descriptor_id: str,
+    energy_unit: str = ENERGY_UNIT_KCAL,
+    reactant_keywords: Optional[List[str]] = None,
+    product_keywords: Optional[List[str]] = None,
+) -> pd.DataFrame:
+    """Calculate one descriptor across every applicable reaction pair.
+
+    Cached by dataframe content; kept for callers that have no cheaper way to
+    identify their frame. The dashboard uses the fingerprinted variant below.
+    """
+    return _selected_descriptor_dataframe(
+        df,
+        descriptor_id,
+        energy_unit=energy_unit,
+        reactant_keywords=reactant_keywords,
+        product_keywords=product_keywords,
+    )
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def fingerprinted_selected_descriptor_dataframe(
+    data_fingerprint: str,
+    _df: pd.DataFrame,
+    descriptor_id: str,
+    energy_unit: str = ENERGY_UNIT_KCAL,
+    reactant_keywords: Optional[List[str]] = None,
+    product_keywords: Optional[List[str]] = None,
+) -> pd.DataFrame:
+    """Descriptor table cached by dataset fingerprint instead of frame content.
+
+    Hashing the multi-MB XYZ columns on every rerun dominates descriptor-tab
+    latency; the fingerprint (files hash + active filters) identifies ``_df``.
+    """
+    return _selected_descriptor_dataframe(
+        _df,
+        descriptor_id,
+        energy_unit=energy_unit,
+        reactant_keywords=reactant_keywords,
+        product_keywords=product_keywords,
+    )
+
+
+def convert_descriptor_records_energy_unit(
+    records: pd.DataFrame,
+    energy_unit: str,
+) -> pd.DataFrame:
+    """Convert cached kcal/mol descriptor ΔG values to the display unit.
+
+    Every ΔG path in the descriptor pipeline is linear in the unit factor, so
+    records are computed once in kcal/mol and converted here. This keeps the
+    expensive geometry/descriptor work out of the energy-unit cache key.
+    """
+    validate_energy_unit(energy_unit)
+    if records.empty or energy_unit == ENERGY_UNIT_KCAL:
+        return records
+
+    converted = records.copy()
+    converted["deltaG"] = (
+        pd.to_numeric(converted["deltaG"], errors="coerce") / EV_TO_KCAL_MOL
+    )
+    converted["deltaG_unit"] = energy_unit
+    return converted
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def fingerprinted_descriptor_keyword_options(
+    data_fingerprint: str,
+    _df: pd.DataFrame,
+    role: str,
+) -> List[str]:
+    """Cache descriptor keyword options by dataset fingerprint."""
+    return extract_descriptor_keyword_options(_df, role)
 
 
 def build_descriptor_hover_html(
@@ -5087,6 +5190,25 @@ def build_descriptor_delta_hover_html(
 </body>
 </html>
 """
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def fingerprinted_descriptor_delta_hover_html(
+    cache_key: Tuple,
+    _descriptor_records: pd.DataFrame,
+    title: str,
+    descriptor_unit_label: str,
+    energy_unit_label: str,
+    y_axis_label: str,
+) -> str:
+    """Cache the descriptor hover HTML payload by its selection cache key."""
+    return build_descriptor_delta_hover_html(
+        _descriptor_records,
+        title,
+        descriptor_unit_label,
+        energy_unit_label,
+        y_axis_label,
+    )
 
 
 def create_ir_spectrum_plot(
@@ -5856,6 +5978,26 @@ def calculate_reaction_table(
     )
 
 
+@st.cache_data(ttl=3600, show_spinner=False)
+def fingerprinted_reaction_table(
+    data_fingerprint: str,
+    _df: pd.DataFrame,
+    energy_unit: str,
+) -> Dict[str, Any]:
+    """Cache the reaction ΔG table (or its schema error) by dataset fingerprint.
+
+    Returning the error as data lets the failure be cached too; raising would
+    force the full name-parsing pass to repeat on every rerun.
+    """
+    try:
+        return {
+            "table": calculate_reaction_table(_df, energy_unit=energy_unit),
+            "error": None,
+        }
+    except ValueError as exc:
+        return {"table": pd.DataFrame(), "error": str(exc)}
+
+
 def format_optional_number(value, digits: int = 4) -> str:
     """Format a numeric value, or N/A when unavailable."""
     if is_missing_scalar(value):
@@ -5936,6 +6078,15 @@ def build_ligand_selector_df(df: pd.DataFrame) -> pd.DataFrame:
     ).reset_index(drop=True)
 
     return selector_df[["unique_name", "bipyridine", "alkyne", "role"]]
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def fingerprinted_ligand_selector_df(
+    data_fingerprint: str,
+    _df: pd.DataFrame,
+) -> pd.DataFrame:
+    """Cache the parsed ligand selector table by dataset fingerprint."""
+    return build_ligand_selector_df(_df)
 
 
 # ============================================================================
@@ -6034,11 +6185,23 @@ def main(data_paths: Optional[List[str]] = None):
         )
 
         if uploaded_files:
-            with st.spinner("Processing uploaded files..."):
-                saved_paths = data_manager.save_uploaded_files(uploaded_files)
-                st.success(f"Loaded {len(saved_paths)} file(s)")
-                st.session_state.data_loaded = True
+            # The uploader returns its files on every rerun; only re-save and
+            # re-convert them when the uploaded set actually changes.
+            upload_signature = tuple(
+                sorted(
+                    (uploaded_file.name, getattr(uploaded_file, "size", None))
+                    for uploaded_file in uploaded_files
+                    if uploaded_file is not None
+                )
+            )
+            if st.session_state.get("upload_signature") != upload_signature:
+                with st.spinner("Processing uploaded files..."):
+                    saved_paths = data_manager.save_uploaded_files(uploaded_files)
+                st.session_state["upload_signature"] = upload_signature
+                st.session_state["upload_file_count"] = len(saved_paths)
+                st.session_state.data_loaded = bool(saved_paths)
                 st.session_state["cli_loaded_paths"] = []
+            st.success(f"Loaded {st.session_state.get('upload_file_count', 0)} file(s)")
 
         if st.session_state.get("cli_loaded_paths"):
             st.success(
@@ -6152,18 +6315,18 @@ def main(data_paths: Optional[List[str]] = None):
             # Molecule Selector
             st.header("🔬 Molecule Selector")
 
-            # Get filtered molecule names based on current filters
-            filtered_df = data_manager.get_filtered_data(
-                formula=st.session_state.get("filter_formula", None),
-                opt_converged=st.session_state.get("filter_converged", None),
-                smiles_changed=st.session_state.get("filter_smiles_changed", None),
-                number_of_imaginary_max=st.session_state.get("filter_max_imag", None),
-                text_filter=(
-                    st.session_state.get("filter_text", "")
-                    if st.session_state.get("filter_text", "")
-                    else None
-                ),
-                limit=None,  # Get all for molecule selector
+            # Load the filtered dataset once per filter change; every tab below
+            # reuses this frame and fingerprint instead of re-querying.
+            active_filters = {
+                "formula": st.session_state.get("filter_formula", None),
+                "opt_converged": st.session_state.get("filter_converged", None),
+                "smiles_changed": st.session_state.get("filter_smiles_changed", None),
+                "number_of_imaginary_max": st.session_state.get("filter_max_imag", None),
+                "text_filter": st.session_state.get("filter_text", "") or None,
+            }
+            filtered_df, data_fingerprint = load_session_filtered_data(
+                data_manager,
+                active_filters,
             )
 
             if not filtered_df.empty and "unique_name" in filtered_df.columns:
@@ -6247,7 +6410,10 @@ def main(data_paths: Optional[List[str]] = None):
         single_calc_molecule_names = molecule_names if "molecule_names" in locals() else []
         use_ligand_selector_navigation = False
 
-        ligand_selector_df = build_ligand_selector_df(filtered_df)
+        ligand_selector_df = fingerprinted_ligand_selector_df(
+            data_fingerprint,
+            filtered_df,
+        )
 
         if not ligand_selector_df.empty:
             st.subheader("Select by Ligands")
@@ -6474,32 +6640,33 @@ def main(data_paths: Optional[List[str]] = None):
                                 "selected_molecule_index",
                             )
 
+                    # The on_click callbacks already update the selection before
+                    # Streamlit's automatic rerun; calling st.rerun() on top of
+                    # that doubled every navigation click's latency.
                     nav_col_left, nav_col_center, nav_col_right = st.columns(
                         [1.35, 0.7, 1.35]
                     )
                     with nav_col_left:
-                        if st.button(
+                        st.button(
                             "⬅️ Previous molecule",
                             width="stretch",
                             disabled=current_index == 0,
                             on_click=_go_prev,
                             key="single_calc_prev_button",
-                        ):
-                            st.rerun()
+                        )
                     with nav_col_center:
                         st.write(
                             f"{current_index + 1} of {len(single_calc_molecule_names)}",
                         )
                     with nav_col_right:
-                        if st.button(
+                        st.button(
                             "Next molecule ➡️",
                             width="stretch",
                             disabled=current_index == len(single_calc_molecule_names) - 1,
                             on_click=_go_next,
                             key="single_calc_next_button",
                             type="primary",
-                        ):
-                            st.rerun()
+                        )
 
                 structure_views = get_single_calculation_structure_views(molecule_data)
                 if structure_views:
@@ -6609,7 +6776,7 @@ def main(data_paths: Optional[List[str]] = None):
                         col_vib1, col_vib2 = st.columns([3, 2])
 
                         with col_vib1:
-                            st.plotly_chart(fig_vib, width="stretch")
+                            st.plotly_chart(fig_vib, width="stretch", key="single_calc_ir_plot")
 
                         with col_vib2:
                             st.dataframe(
@@ -6618,7 +6785,7 @@ def main(data_paths: Optional[List[str]] = None):
                                 hide_index=True,
                             )
                     elif fig_vib is not None:
-                        st.plotly_chart(fig_vib, width="stretch")
+                        st.plotly_chart(fig_vib, width="stretch", key="single_calc_ir_plot_full")
                     else:
                         st.dataframe(
                             freq_table,
@@ -6644,33 +6811,28 @@ def main(data_paths: Optional[List[str]] = None):
     # Tab 2: Dataset Analytics
     # ========================================================================
     with tab2:
-        # Get filtered data first (no limit - load all matching rows)
-        with st.spinner("Loading filtered data..."):
-            df_full = data_manager.get_filtered_data(
-                formula=st.session_state.get("filter_formula", None),
-                opt_converged=st.session_state.get("filter_converged", None),
-                smiles_changed=st.session_state.get("filter_smiles_changed", None),
-                text_filter=(
-                    st.session_state.get("filter_text", "")
-                    if st.session_state.get("filter_text", "")
-                    else None
-                ),
-                limit=None,  # No limit - load all matching rows
-            )
+        # Reuse the session-cached filtered frame loaded in the sidebar. This
+        # also applies the imaginary-frequency filter, which this tab
+        # previously ignored while every other tab honored it.
+        df_full = filtered_df
 
         # Dataset size selector slider
         if not df_full.empty:
             total_rows = len(df_full)
             initial_rows = min(1000, total_rows)  # Initial value: 1000 or total if less
 
-            selected_rows = st.slider(
-                "Select number of rows for analysis",
-                min_value=1,
-                max_value=total_rows,
-                value=initial_rows,
-                step=100,
-                help=f"Total filtered rows: {total_rows}. Select how many rows to use for analytics and plotting.",
-            )
+            if total_rows > 1:
+                selected_rows = st.slider(
+                    "Select number of rows for analysis",
+                    min_value=1,
+                    max_value=total_rows,
+                    value=initial_rows,
+                    step=100 if total_rows > 100 else 1,
+                    help=f"Total filtered rows: {total_rows}. Select how many rows to use for analytics and plotting.",
+                )
+            else:
+                # st.slider raises when min_value == max_value.
+                selected_rows = total_rows
 
             # Limit dataframe to selected number of rows
             df = df_full.head(selected_rows)
@@ -6716,8 +6878,16 @@ def main(data_paths: Optional[List[str]] = None):
         # Calculate statistics from filtered dataframe
         total_rows = len(df)
         unique_formulas = df["formula"].nunique() if "formula" in df.columns else 0
-        converged_count = df["opt_converged"].sum() if "opt_converged" in df.columns else 0
-        not_converged_count = (~df["opt_converged"]).sum() if "opt_converged" in df.columns else 0
+        converged_count = 0
+        not_converged_count = 0
+        if "opt_converged" in df.columns:
+            # ``~series`` raises on float/object columns with missing values, so
+            # normalize to a nullable boolean before counting.
+            converged_series = df["opt_converged"].map(
+                lambda value: None if is_missing_scalar(value) else bool(value)
+            ).astype("boolean")
+            converged_count = int(converged_series.fillna(False).sum())
+            not_converged_count = int((~converged_series).fillna(False).sum())
 
         col1, col2, col3, col4 = st.columns(4)
         with col1:
@@ -6734,7 +6904,20 @@ def main(data_paths: Optional[List[str]] = None):
         # Plot 1: Energy Comparison Scatter Plot
         st.subheader("Energy Comparison: Initial vs Optimized")
         if "initial_energy_eV" in df.columns and "opt_energy_eV" in df.columns:
-            energy_plot_df = df.copy()
+            # Copy only the plotted columns; a full-frame copy duplicates every
+            # XYZ string just to add two derived columns.
+            scatter_columns = [
+                column
+                for column in (
+                    "initial_energy_eV",
+                    "opt_energy_eV",
+                    "opt_converged",
+                    "formula",
+                    "unique_name",
+                )
+                if column in df.columns
+            ]
+            energy_plot_df = df[scatter_columns].copy()
             energy_plot_df["initial_energy_display"] = convert_energy_series(
                 energy_plot_df["initial_energy_eV"],
                 energy_unit,
@@ -6749,12 +6932,21 @@ def main(data_paths: Optional[List[str]] = None):
             if energy_plot_df.empty:
                 st.warning("Initial/optimized energy pairs are not available in dataset.")
             else:
+                hover_columns = [
+                    column
+                    for column in ("formula", "unique_name")
+                    if column in energy_plot_df.columns
+                ]
                 fig_scatter = px.scatter(
                     energy_plot_df,
                     x="initial_energy_display",
                     y="opt_energy_display",
-                    color="opt_converged",
-                    hover_data=["formula", "unique_name"],
+                    color=(
+                        "opt_converged"
+                        if "opt_converged" in energy_plot_df.columns
+                        else None
+                    ),
+                    hover_data=hover_columns or None,
                     labels={
                         "initial_energy_display": f"Initial Energy ({energy_unit})",
                         "opt_energy_display": f"Optimized Energy ({energy_unit})",
@@ -6780,7 +6972,7 @@ def main(data_paths: Optional[List[str]] = None):
                         name="y=x",
                     )
                 )
-                st.plotly_chart(fig_scatter, width="stretch")
+                st.plotly_chart(fig_scatter, width="stretch", key="analytics_energy_scatter")
         else:
             st.warning("Energy columns not available in dataset.")
 
@@ -6794,7 +6986,7 @@ def main(data_paths: Optional[List[str]] = None):
                 labels={"opt_time": "Optimization Time (seconds)", "count": "Frequency"},
                 title="Distribution of Optimization Times",
             )
-            st.plotly_chart(fig_hist, width="stretch")
+            st.plotly_chart(fig_hist, width="stretch", key="analytics_opt_time_hist")
         else:
             st.warning("Optimization time data not available.")
 
@@ -6808,7 +7000,7 @@ def main(data_paths: Optional[List[str]] = None):
                 labels={"number_of_atoms": "Number of Atoms", "count": "Frequency"},
                 title="Distribution of Number of Atoms",
             )
-            st.plotly_chart(fig_atoms, width="stretch")
+            st.plotly_chart(fig_atoms, width="stretch", key="analytics_atoms_hist")
         else:
             st.warning("Number of atoms data not available.")
 
@@ -6821,7 +7013,7 @@ def main(data_paths: Optional[List[str]] = None):
                 names=["Converged" if x else "Not Converged" for x in convergence_counts.index],
                 title="Convergence Status Distribution",
             )
-            st.plotly_chart(fig_pie, width="stretch")
+            st.plotly_chart(fig_pie, width="stretch", key="analytics_convergence_pie")
         else:
             st.warning("Convergence data not available.")
 
@@ -6835,7 +7027,7 @@ def main(data_paths: Optional[List[str]] = None):
                 labels={"number_of_electrons": "Number of Electrons", "count": "Frequency"},
                 title="Distribution of Number of Electrons",
             )
-            st.plotly_chart(fig_electrons, width="stretch")
+            st.plotly_chart(fig_electrons, width="stretch", key="analytics_electrons_hist")
         else:
             st.warning("Number of electrons data not available.")
 
@@ -6856,7 +7048,7 @@ def main(data_paths: Optional[List[str]] = None):
                     labels={"initial_sym_number": "Initial Symmetry Number", "count": "Frequency"},
                     title="Distribution of Initial Symmetry Numbers",
                 )
-                st.plotly_chart(fig_init_sym, width="stretch")
+                st.plotly_chart(fig_init_sym, width="stretch", key="analytics_initial_sym_hist")
             else:
                 st.warning("Initial symmetry number data not available.")
         
@@ -6873,7 +7065,7 @@ def main(data_paths: Optional[List[str]] = None):
                     labels={"opt_sym_number": "Optimized Symmetry Number", "count": "Frequency"},
                     title="Distribution of Optimized Symmetry Numbers",
                 )
-                st.plotly_chart(fig_opt_sym, width="stretch")
+                st.plotly_chart(fig_opt_sym, width="stretch", key="analytics_opt_sym_hist")
             else:
                 st.warning("Optimized symmetry number data not available.")
 
@@ -6923,7 +7115,7 @@ def main(data_paths: Optional[List[str]] = None):
                 height=700,
                 width=800,
             )
-            st.plotly_chart(fig_corr, width="stretch")
+            st.plotly_chart(fig_corr, width="stretch", key="analytics_corr_heatmap")
         else:
             st.info("Not enough numerical columns for correlation analysis.")
 
@@ -6953,7 +7145,7 @@ def main(data_paths: Optional[List[str]] = None):
                 )
 
                 if fig_vib is not None:
-                    st.plotly_chart(fig_vib, width="stretch")
+                    st.plotly_chart(fig_vib, width="stretch", key="analytics_ir_plot")
                 else:
                     st.info(
                         "No IR spectrum or vibrational frequency data available "
@@ -6970,19 +7162,7 @@ def main(data_paths: Optional[List[str]] = None):
     with descriptors_tab:
         st.subheader("Geometry Descriptors")
 
-        with st.spinner("Loading data for descriptors..."):
-            descriptor_source_df = data_manager.get_filtered_data(
-                formula=st.session_state.get("filter_formula", None),
-                opt_converged=st.session_state.get("filter_converged", None),
-                smiles_changed=st.session_state.get("filter_smiles_changed", None),
-                number_of_imaginary_max=st.session_state.get("filter_max_imag", None),
-                text_filter=(
-                    st.session_state.get("filter_text", "")
-                    if st.session_state.get("filter_text", "")
-                    else None
-                ),
-                limit=None,
-            )
+        descriptor_source_df = filtered_df
 
         if descriptor_source_df.empty:
             st.warning("No descriptor data available with current filters.")
@@ -7028,11 +7208,13 @@ def main(data_paths: Optional[List[str]] = None):
                 selected_reactant_keywords: List[str] = []
                 selected_product_keywords: List[str] = []
                 with st.expander("Optional keyword filters", expanded=False):
-                    reactant_keyword_options = extract_descriptor_keyword_options(
+                    reactant_keyword_options = fingerprinted_descriptor_keyword_options(
+                        data_fingerprint,
                         descriptor_source_df,
                         "reactant",
                     )
-                    product_keyword_options = extract_descriptor_keyword_options(
+                    product_keyword_options = fingerprinted_descriptor_keyword_options(
+                        data_fingerprint,
                         descriptor_source_df,
                         "product",
                     )
@@ -7059,12 +7241,19 @@ def main(data_paths: Optional[List[str]] = None):
                         else "Calculating"
                     )
                     with st.spinner(f"{descriptor_action} {descriptor['label']}..."):
-                        descriptor_records = build_selected_descriptor_dataframe(
+                        # Compute in kcal/mol regardless of the display unit so
+                        # toggling units reuses the cached geometry work.
+                        descriptor_records = fingerprinted_selected_descriptor_dataframe(
+                            data_fingerprint,
                             descriptor_source_df,
                             selected_descriptor_id,
-                            energy_unit=energy_unit,
+                            energy_unit=ENERGY_UNIT_KCAL,
                             reactant_keywords=selected_reactant_keywords,
                             product_keywords=selected_product_keywords,
+                        )
+                        descriptor_records = convert_descriptor_records_energy_unit(
+                            descriptor_records,
+                            energy_unit,
                         )
 
                     if descriptor_records.empty:
@@ -7125,7 +7314,14 @@ def main(data_paths: Optional[List[str]] = None):
                                 format_optional_number(delta_values_numeric.max()),
                             )
 
-                        descriptor_html = build_descriptor_delta_hover_html(
+                        descriptor_html = fingerprinted_descriptor_delta_hover_html(
+                            (
+                                data_fingerprint,
+                                selected_descriptor_id,
+                                energy_unit,
+                                tuple(selected_reactant_keywords),
+                                tuple(selected_product_keywords),
+                            ),
                             descriptor_records,
                             descriptor["label"],
                             descriptor_unit_label,
@@ -7311,7 +7507,7 @@ def main(data_paths: Optional[List[str]] = None):
                                         title=f"Largest {selected_metric_label} Differences",
                                     )
                                     fig_metric.update_layout(xaxis_tickangle=-45)
-                                    st.plotly_chart(fig_metric, width="stretch")
+                                    st.plotly_chart(fig_metric, width="stretch", key="comparison_metric_bar")
 
                             st.markdown("---")
                             st.subheader("Matched Row Details")
@@ -7555,7 +7751,7 @@ def main(data_paths: Optional[List[str]] = None):
                                     "available for the selected comparison."
                                 )
                             else:
-                                st.plotly_chart(spectrum_fig, width="stretch")
+                                st.plotly_chart(spectrum_fig, width="stretch", key="comparison_spectrum_plot")
                                 if not spectrum_summary.empty:
                                     st.dataframe(
                                         spectrum_summary,
@@ -7595,20 +7791,8 @@ def main(data_paths: Optional[List[str]] = None):
     with tab3:
         st.subheader("⚗️ Carboxylation Reaction ΔG Analysis")
 
-        # Load filtered data (same filters as analytics)
-        with st.spinner("Loading data for reactions..."):
-            df_reac = data_manager.get_filtered_data(
-                formula=st.session_state.get("filter_formula", None),
-                opt_converged=st.session_state.get("filter_converged", None),
-                smiles_changed=st.session_state.get("filter_smiles_changed", None),
-                number_of_imaginary_max=st.session_state.get("filter_max_imag", None),
-                text_filter=(
-                    st.session_state.get("filter_text", "")
-                    if st.session_state.get("filter_text", "")
-                    else None
-                ),
-                limit=None,
-            )
+        # Same filters as the other tabs, via the shared session-cached frame.
+        df_reac = filtered_df
 
         if df_reac.empty:
             st.warning("No reaction data available with current filters.")
@@ -7624,9 +7808,21 @@ def main(data_paths: Optional[List[str]] = None):
         try:
             # Calculate reaction delta G values
             with st.spinner("Calculating reaction ΔG values..."):
-                delta_df = calculate_reaction_table(df_reac, energy_unit=energy_unit)
+                reaction_payload = fingerprinted_reaction_table(
+                    data_fingerprint,
+                    df_reac,
+                    energy_unit,
+                )
+            reaction_schema_error = reaction_payload["error"]
+            delta_df = reaction_payload["table"]
 
-            if delta_df.empty:
+            if reaction_schema_error:
+                st.error(f"Error processing reactions: {reaction_schema_error}")
+                st.info(
+                    "Please ensure the dataset contains either IQC CO2/reactant/product "
+                    "entries with G_eV, or reaction table rows with reaction_gibbs_kcal."
+                )
+            elif delta_df.empty:
                 st.warning("No complete reactions found.")
                 st.info(
                     "For IQC thermo datasets, ensure entries include reactant, product, "
@@ -7664,7 +7860,7 @@ def main(data_paths: Optional[List[str]] = None):
                     xaxis_tickangle=-45,
                 )
 
-                st.plotly_chart(fig_heatmap, width="stretch")
+                st.plotly_chart(fig_heatmap, width="stretch", key="reactions_deltag_heatmap")
 
                 st.markdown("---")
 
@@ -7958,14 +8154,8 @@ def main(data_paths: Optional[List[str]] = None):
                 # Add a vertical line at ΔG = 0
                 fig_deltag.add_vline(x=0, line_dash="dash", line_color="red", annotation_text="ΔG=0")
 
-                st.plotly_chart(fig_deltag, width="stretch")
+                st.plotly_chart(fig_deltag, width="stretch", key="reactions_deltag_hist")
 
-        except ValueError as ve:
-            st.error(f"Error processing reactions: {ve}")
-            st.info(
-                "Please ensure the dataset contains either IQC CO2/reactant/product "
-                "entries with G_eV, or reaction table rows with reaction_gibbs_kcal."
-            )
         except Exception as e:
             st.error(f"Unexpected error in reactions analysis: {e}")
             st.info("Please check your data format and try again.")
