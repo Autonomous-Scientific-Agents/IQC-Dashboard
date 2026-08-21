@@ -48,7 +48,15 @@ Filter datasets by:
 - Task type  
 - Chemical formula  
 - Convergence status  
-- Number of atoms  
+- SMILES changes and imaginary-frequency counts  
+- Free-text/regex search over names and SMILES  
+
+Filters only appear when the loaded data actually contains the column with
+more than one value, and the sidebar shows a live count of matching rows.
+
+### 📥 Data Explorer & Export
+- Browse the filtered rows with selectable columns directly in the app
+- Download the filtered dataset, reaction ΔG table, and descriptor data as CSV
 
 ### 🔍 Single Molecule Inspector
 Deep dive into one molecule at a time with:
