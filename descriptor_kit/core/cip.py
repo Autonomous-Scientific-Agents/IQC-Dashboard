@@ -11,11 +11,11 @@ number (C1 = the alkyne carbon with the smaller geometry index, source
 The alkyne organic fragment ({cA,cB} + both substituents, Ni stripped) is rebuilt
 as a metal-free RDKit molecule on *our* distance-based connectivity, bond orders
 are perceived with rdDetermineBonds.DetermineBondOrders(charge=0) (neutral,
-closed-shell), then the two substituents are ranked by CIP.
+closed-shell), then the two substituents are ranked by RDKit's true CIP labeler.
 """
 from __future__ import annotations
 from rdkit import Chem
-from rdkit.Chem import rdDetermineBonds
+from rdkit.Chem import rdCIPLabeler, rdDetermineBonds
 
 
 def _build_alkyne_mol(geom, alkyne_pair, r_a_atoms, r_b_atoms):
@@ -53,10 +53,95 @@ def _build_alkyne_mol(geom, alkyne_pair, r_a_atoms, r_b_atoms):
 _PERIODIC = Chem.GetPeriodicTable()
 
 
-def _cip_compare_branches(mol, parent_a, root_a, parent_b, root_b,
-                          max_spheres=None):
-    """Compare two CIP hierarchical digraphs by the standard sphere-by-sphere
-    rule and return +1 if branch A outranks B, -1 if B outranks A, 0 if tied.
+def _copy_branch(rw, mol, atom_indices):
+    """Copy one substituent into ``rw`` and return old-to-new atom indices."""
+    atom_indices = frozenset(atom_indices)
+    remap = {}
+    for old_idx in sorted(atom_indices):
+        remap[old_idx] = rw.AddAtom(Chem.Atom(mol.GetAtomWithIdx(old_idx)))
+    for bond in mol.GetBonds():
+        begin = bond.GetBeginAtomIdx()
+        end = bond.GetEndAtomIdx()
+        if begin in remap and end in remap:
+            rw.AddBond(remap[begin], remap[end], bond.GetBondType())
+    return remap
+
+
+def _cip_compare_branches(mol, root_a, root_b, atoms_a, atoms_b):
+    """Return +1 if substituent A outranks B, -1 if B outranks A, or 0.
+
+    RDKit's true CIP implementation labels stereogenic atoms rather than
+    exposing a public ligand-comparison API.  To compare these two ligands, make
+    independent copies of them and attach their roots to a tetrahedral carbon
+    alongside deuterium and tritium.  For equal root atomic numbers above H, the
+    two real ligands are priorities 1/2 and T/D are priorities 3/4.  With the
+    fixed neighbour insertion order and clockwise chiral tag below, an ``S``
+    label means A outranks B and ``R`` means B outranks A.
+
+    Equivalent ligands leave the probe achiral.  Canonical symmetry ranks
+    distinguish that valid tie from an unexpected CIP-labeling failure.
+    """
+    atoms_a = frozenset(atoms_a)
+    atoms_b = frozenset(atoms_b)
+    assert root_a in atoms_a, "root_a must be in atoms_a"
+    assert root_b in atoms_b, "root_b must be in atoms_b"
+
+    atomic_num_a = mol.GetAtomWithIdx(root_a).GetAtomicNum()
+    atomic_num_b = mol.GetAtomWithIdx(root_b).GetAtomicNum()
+    if atomic_num_a != atomic_num_b:
+        return 1 if atomic_num_a > atomic_num_b else -1
+    if atomic_num_a == 1:
+        # Geometry input carries ordinary protium only, so two H roots tie.
+        return 0
+
+    rw = Chem.RWMol()
+    center = rw.AddAtom(Chem.Atom(6))
+    remap_a = _copy_branch(rw, mol, atoms_a)
+    remap_b = _copy_branch(rw, mol, atoms_b)
+
+    deuterium = Chem.Atom(1)
+    deuterium.SetIsotope(2)
+    deuterium.SetNoImplicit(True)
+    d_idx = rw.AddAtom(deuterium)
+    tritium = Chem.Atom(1)
+    tritium.SetIsotope(3)
+    tritium.SetNoImplicit(True)
+    t_idx = rw.AddAtom(tritium)
+
+    # Bond insertion order is part of RDKit's tetrahedral chiral-tag encoding.
+    rw.AddBond(center, remap_a[root_a], Chem.BondType.SINGLE)
+    rw.AddBond(center, remap_b[root_b], Chem.BondType.SINGLE)
+    rw.AddBond(center, d_idx, Chem.BondType.SINGLE)
+    rw.AddBond(center, t_idx, Chem.BondType.SINGLE)
+
+    probe = rw.GetMol()
+    Chem.SanitizeMol(probe)
+    symmetry = Chem.CanonicalRankAtoms(
+        probe, breakTies=False, includeChirality=False
+    )
+    if symmetry[remap_a[root_a]] == symmetry[remap_b[root_b]]:
+        return 0
+
+    probe.GetAtomWithIdx(center).SetChiralTag(Chem.ChiralType.CHI_TETRAHEDRAL_CW)
+    rdCIPLabeler.AssignCIPLabels(probe, [center])
+    center_atom = probe.GetAtomWithIdx(center)
+    if not center_atom.HasProp("_CIPCode"):
+        raise ValueError("RDKit could not assign the substituent-priority probe")
+    code = center_atom.GetProp("_CIPCode").upper()
+    if code == "S":
+        return 1
+    if code == "R":
+        return -1
+    raise ValueError(f"unexpected tetrahedral CIP code {code!r}")
+
+
+def _compare_rooted_graphs(mol, parent_a, root_a, parent_b, root_b,
+                           max_spheres=None):
+    """Compare the rooted bpy environments used to order donor nitrogens.
+
+    This historical sphere traversal remains only for donor-ring ordering.  It
+    is deliberately not used for alkyne C1/C2 assignment, which delegates the
+    full priority decision to ``rdCIPLabeler`` above.
 
     A "branch" is the substituent subtree rooted at `root_*` with `parent_*`
     excluded (the atom the substituent is attached to).  Multiple bonds are
@@ -68,8 +153,8 @@ def _cip_compare_branches(mol, parent_a, root_a, parent_b, root_b,
     The comparison proceeds breadth-first: at each sphere the multiset of
     atomic numbers of the two frontiers is compared (sorted descending); the
     first difference decides.  Ties expand each frontier node's children in the
-    matched order.  This is a faithful implementation sufficient to order the
-    constitutionally-distinct substituents in this dataset.
+    matched order.  It is sufficient to order the constitutionally-distinct bpy
+    environments in the curated dataset.
     """
     def children(atom_idx, came_from_idx):
         """Yield (atomic_number, next_atom_idx_or_None) for CIP digraph
@@ -168,12 +253,16 @@ def label_alkyne_carbons(geom, alkyne_pair, r_a_root, r_b_root,
     r_b_atoms = frozenset(r_b_atoms)
 
     # --- standard (plain) CIP ranking ---
-    # Build the metal-free alkyne molecule with perceived bond orders, then
-    # compare the two substituent CIP digraphs sphere-by-sphere.
+    # Build the metal-free alkyne molecule with perceived bond orders, then use
+    # RDKit's true CIP labeler to compare independent copies of the two arms.
     mol, remap = _build_alkyne_mol(geom, alkyne_pair, r_a_atoms, r_b_atoms)
-    cmp = _cip_compare_branches(mol,
-                                parent_a=remap[cA], root_a=remap[r_a_root],
-                                parent_b=remap[cB], root_b=remap[r_b_root])
+    cmp = _cip_compare_branches(
+        mol,
+        root_a=remap[r_a_root],
+        root_b=remap[r_b_root],
+        atoms_a={remap[idx] for idx in r_a_atoms},
+        atoms_b={remap[idx] for idx in r_b_atoms},
+    )
     if cmp == 0:
         # Symmetric alkyne: the two substituents are CIP-indistinguishable, so
         # plain CIP cannot order the carbons.  Break the tie by input atom
@@ -243,7 +332,7 @@ def compare_ring_nitrogens(geom, bpy_atoms, n_a, n_b, max_spheres=14):
     if sym[ia] == sym[ib]:
         return 0
 
-    cmp = _cip_compare_branches(
+    cmp = _compare_rooted_graphs(
         mol,
         parent_a=-1,
         root_a=ia,
