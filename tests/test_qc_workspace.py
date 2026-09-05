@@ -1,10 +1,13 @@
 """Smoke coverage for the calculation-files Streamlit workspace."""
 
+from pathlib import Path
+
 from streamlit.testing.v1 import AppTest
 
 
 def test_calculation_files_workspace_opens_without_dataset():
-    app = AppTest.from_file("streamlit_app.py", default_timeout=20).run()
+    entrypoint = Path(__file__).resolve().parents[1] / "streamlit_app.py"
+    app = AppTest.from_file(entrypoint, default_timeout=20).run()
     workspace = next(radio for radio in app.radio if radio.label == "Workspace")
     workspace.set_value("Calculation files").run()
 
