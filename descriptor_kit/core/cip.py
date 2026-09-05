@@ -1,12 +1,12 @@
-"""Alkyne carbon CIP labeling (C1/C2) — pure CIP, no overrides.
+"""Alkyne carbon CIP labeling (C1/C2) for constitutionally distinct arms.
 
 Spec §5.1.  Convention is INVERTED: c1 = carbon bearing the LOWER-priority
 substituent, c2 = carbon bearing the HIGHER-priority substituent.
 
-This kit uses PLAIN CIP only.  A symmetric alkyne, whose two substituents are
-CIP-indistinguishable, cannot be ordered by CIP; the tie is broken by input atom
-number (C1 = the alkyne carbon with the smaller geometry index, source
-"symmetric_atom_order").
+Constitutionally equivalent substituents deliberately tie: the substituent
+libraries do not distinguish stereoisomers, so stereochemical tiebreakers are
+outside this kit's scope.  The tie is broken by input atom number (C1 = the
+alkyne carbon with the smaller geometry index, source "symmetric_atom_order").
 
 The alkyne organic fragment ({cA,cB} + both substituents, Ni stripped) is rebuilt
 as a metal-free RDKit molecule on *our* distance-based connectivity, bond orders
@@ -78,8 +78,9 @@ def _cip_compare_branches(mol, root_a, root_b, atoms_a, atoms_b):
     fixed neighbour insertion order and clockwise chiral tag below, an ``S``
     label means A outranks B and ``R`` means B outranks A.
 
-    Equivalent ligands leave the probe achiral.  Canonical symmetry ranks
-    distinguish that valid tie from an unexpected CIP-labeling failure.
+    Canonical symmetry ranks ignoring chirality deliberately treat
+    constitutionally equivalent ligands as tied before CIP labeling.  A missing
+    CIP label for constitutionally distinct ligands is a perception failure.
     """
     atoms_a = frozenset(atoms_a)
     atoms_b = frozenset(atoms_b)
