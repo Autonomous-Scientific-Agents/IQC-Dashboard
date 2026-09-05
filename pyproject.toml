@@ -26,6 +26,7 @@ classifiers = [
 
 dependencies = [
     "streamlit>=1.49.0",
+    "cclib>=1.8.1,<2",
     "duckdb>=0.9.0",
     "pandas>=2.0.0",
     "pyarrow>=14.0.0",

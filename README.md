@@ -64,6 +64,22 @@ Deep dive into one molecule at a time with:
 - Energy breakdown  
 - Vibrational and thermochemical properties  
 
+### 🧾 Raw Calculation File Inspector
+- Upload individual quantum-chemistry files, a folder tree, or a ZIP archive
+- Detect and parse cclib-supported output formats by content
+- Preview Gaussian, ORCA, Q-Chem, and XYZ input structures and settings
+- Explore optimization trajectories, convergence criteria, vibrational modes,
+  broadened IR spectra, orbitals, charges, thermochemistry, and electronic transitions
+- Keep parser failures, program termination, SCF status, and geometry convergence
+  separate, with source-line evidence for detected warnings and errors
+- Export calculation inventories, diagnostics, trajectories, spectra, and energy tables
+
+Choose **Calculation files** from the sidebar workspace selector. Output-property
+coverage depends on the program, version, calculation type, and what was printed;
+the inspector only shows views backed by parsed data. Multi-job files are flagged
+when stage boundaries cannot be aligned safely. Structured input previews currently
+support Cartesian Gaussian, ORCA, and Q-Chem inputs plus XYZ files.
+
 ---
 
 ## Quick Start

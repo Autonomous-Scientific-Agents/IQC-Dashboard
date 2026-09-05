@@ -27,6 +27,8 @@ import socket
 import subprocess
 import sys
 
+from iqc_dashboard.qc_ui import render_calculation_workspace
+
 EV_TO_KCAL_MOL = 23.0605
 ENERGY_UNIT_KCAL = "kcal/mol"
 ENERGY_UNIT_EV = "eV"
@@ -6229,6 +6231,13 @@ def main(data_paths: Optional[List[str]] = None):
         unsafe_allow_html=True,
     )
 
+    workspace = st.sidebar.radio(
+        "Workspace",
+        ["IQC datasets", "Calculation files"],
+        key="dashboard_workspace",
+        help="Explore prepared IQC datasets or inspect raw quantum-chemistry files.",
+    )
+
     energy_unit = st.radio(
         "Energy units",
         options=ENERGY_UNITS,
@@ -6269,6 +6278,10 @@ def main(data_paths: Optional[List[str]] = None):
             )
 
     st.markdown("---")
+
+    if workspace == "Calculation files":
+        render_calculation_workspace(energy_unit)
+        return
 
     # Initialize session state
     if "data_manager" not in st.session_state:
