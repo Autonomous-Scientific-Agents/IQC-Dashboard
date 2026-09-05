@@ -1,6 +1,7 @@
 # The app uses width="stretch" on buttons/dataframes/charts, which needs the
 # width/height element API introduced across Streamlit 1.46-1.49.
 streamlit>=1.49.0
+cclib>=1.8.1,<2
 duckdb>=0.9.0
 pandas>=2.0.0
 pyarrow>=14.0.0
